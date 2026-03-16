@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(chmod:*)",
-      "Bash(cd:*)",
-      "Bash(cmd.exe //c \"D:\\\\dev\\\\vscode-tomcat-extension\\\\package.bat\" 2>&1)"
-    ]
-  }
-}

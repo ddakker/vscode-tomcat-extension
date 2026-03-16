@@ -1,3 +1,5 @@
+.claude/
+
 # Build output
 node_modules/
 *.vsix
