@@ -1,0 +1,95 @@
+{
+  "name": "tomcat-auto-deploy",
+  "displayName": "Tomcat Auto Deploy",
+  "description": "저장 시 자동 컴파일/deploy + Tomcat 시작/중지 + Hot Deploy",
+  "version": "0.0.1",
+  "publisher": "your-publisher-name",
+  "engines": { "vscode": "^1.74.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "tomcatAutoDeploy.start",       "title": "Tomcat: 시작",           "icon": "$(play)"        },
+      { "command": "tomcatAutoDeploy.stop",        "title": "Tomcat: 중지",           "icon": "$(debug-stop)"  },
+      { "command": "tomcatAutoDeploy.restart",     "title": "Tomcat: 재시작",         "icon": "$(refresh)"     },
+      { "command": "tomcatAutoDeploy.openBrowser", "title": "Tomcat: 브라우저 열기",   "icon": "$(globe)"       },
+      { "command": "tomcatAutoDeploy.showOutput",  "title": "Tomcat: Output 보기",    "icon": "$(output)"      },
+      { "command": "tomcatAutoDeploy.configure",   "title": "Tomcat: 설정 열기",      "icon": "$(gear)"        }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "tomcatExplorer",
+          "title": "Tomcat",
+          "icon": "$(server-process)"
+        }
+      ]
+    },
+    "views": {
+      "tomcatExplorer": [
+        {
+          "id": "tomcatServerView",
+          "name": "서버",
+          "icon": "$(server-process)",
+          "contextualTitle": "Tomcat 서버"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        { "command": "tomcatAutoDeploy.start",   "when": "view == tomcatServerView && !tomcatAutoDeploy.running", "group": "navigation@1" },
+        { "command": "tomcatAutoDeploy.stop",    "when": "view == tomcatServerView && tomcatAutoDeploy.running",  "group": "navigation@1" },
+        { "command": "tomcatAutoDeploy.restart", "when": "view == tomcatServerView && tomcatAutoDeploy.running",  "group": "navigation@2" },
+        { "command": "tomcatAutoDeploy.configure", "when": "view == tomcatServerView", "group": "navigation@3" }
+      ]
+    },
+    "configuration": {
+      "title": "Tomcat Auto Deploy",
+      "properties": {
+        "tomcatAutoDeploy.catalinaHome": {
+          "type": "string",
+          "default": "",
+          "description": "Tomcat 설치 경로 (CATALINA_HOME). 예: /opt/tomcat"
+        },
+        "tomcatAutoDeploy.javaHome": {
+          "type": "string",
+          "default": "",
+          "description": "JAVA_HOME 경로 (비어있으면 환경변수 사용)"
+        },
+        "tomcatAutoDeploy.javaSourceRoot": {
+          "type": "string",
+          "default": "src/main/java",
+          "description": "Java 소스 루트 (workspace 상대경로)"
+        },
+        "tomcatAutoDeploy.webContentRoot": {
+          "type": "string",
+          "default": "src/main/webapp",
+          "description": "JSP/Static 파일 루트 (workspace 상대경로)"
+        },
+        "tomcatAutoDeploy.classpath": {
+          "type": "array",
+          "default": [],
+          "description": "추가 classpath jar 목록. 예: [\"/opt/tomcat/lib/servlet-api.jar\"]"
+        },
+        "tomcatAutoDeploy.port": {
+          "type": "number",
+          "default": 8080,
+          "description": "Tomcat HTTP 포트"
+        },
+        "tomcatAutoDeploy.debugPort": {
+          "type": "number",
+          "default": 5005,
+          "description": "JPDA 디버그 포트 (HotSwap 용)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "node -e \"require('fs').writeFileSync('build-info.json', JSON.stringify({ buildTime: new Date().toISOString() }))\""
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.74.0",
+    "@types/node": "^18.0.0"
+  }
+}
