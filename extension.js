@@ -772,6 +772,78 @@ function detectBuildTool(ws) {
 }
 
 /**
+ * pom.xml 또는 build.gradle에서 Java 소스/타겟 버전을 추출.
+ * HotSwap 시 바이트코드 호환성을 위해 빌드 도구와 동일한 버전으로 javac를 실행해야 함.
+ * @returns {{ source: string|null, target: string|null }}
+ */
+function detectJavaVersion(ws) {
+  const buildTool = detectBuildTool(ws);
+
+  if (buildTool === 'maven') {
+    try {
+      const pom = fs.readFileSync(path.join(ws, 'pom.xml'), 'utf8');
+      let source = null, target = null;
+
+      // 1) <maven.compiler.source> / <maven.compiler.target> (properties)
+      const srcProp = pom.match(/<maven\.compiler\.source>\s*([^<]+?)\s*<\/maven\.compiler\.source>/);
+      const tgtProp = pom.match(/<maven\.compiler\.target>\s*([^<]+?)\s*<\/maven\.compiler\.target>/);
+      if (srcProp) source = srcProp[1];
+      if (tgtProp) target = tgtProp[1];
+
+      // 2) <maven.compiler.release> (Java 9+)
+      if (!source && !target) {
+        const rel = pom.match(/<maven\.compiler\.release>\s*([^<]+?)\s*<\/maven\.compiler\.release>/);
+        if (rel) { source = rel[1]; target = rel[1]; }
+      }
+
+      // 3) maven-compiler-plugin <configuration><source>/<target>
+      if (!source && !target) {
+        const pluginSrc = pom.match(/<artifactId>\s*maven-compiler-plugin\s*<\/artifactId>[\s\S]*?<source>\s*([^<]+?)\s*<\/source>/);
+        const pluginTgt = pom.match(/<artifactId>\s*maven-compiler-plugin\s*<\/artifactId>[\s\S]*?<target>\s*([^<]+?)\s*<\/target>/);
+        if (pluginSrc) source = pluginSrc[1];
+        if (pluginTgt) target = pluginTgt[1];
+      }
+
+      // 4) maven-compiler-plugin <release>
+      if (!source && !target) {
+        const pluginRel = pom.match(/<artifactId>\s*maven-compiler-plugin\s*<\/artifactId>[\s\S]*?<release>\s*([^<]+?)\s*<\/release>/);
+        if (pluginRel) { source = pluginRel[1]; target = pluginRel[1]; }
+      }
+
+      return { source, target };
+    } catch (_) { /* pom.xml 읽기 실패 — 무시 */ }
+  }
+
+  if (buildTool === 'gradle') {
+    // build.gradle 또는 build.gradle.kts
+    for (const name of ['build.gradle', 'build.gradle.kts']) {
+      const gpath = path.join(ws, name);
+      if (!fs.existsSync(gpath)) continue;
+      try {
+        const gradle = fs.readFileSync(gpath, 'utf8');
+        let source = null, target = null;
+
+        // sourceCompatibility = JavaVersion.VERSION_1_8 / '1.8' / '8' / 8
+        const srcCompat = gradle.match(/sourceCompatibility\s*=\s*(?:JavaVersion\.VERSION_)?['"]?([0-9_.]+)['"]?/);
+        const tgtCompat = gradle.match(/targetCompatibility\s*=\s*(?:JavaVersion\.VERSION_)?['"]?([0-9_.]+)['"]?/);
+        if (srcCompat) source = srcCompat[1].replace(/^1_/, '1.').replace(/_/g, '.');
+        if (tgtCompat) target = tgtCompat[1].replace(/^1_/, '1.').replace(/_/g, '.');
+
+        // javaToolchain / toolchain { languageVersion = JavaLanguageVersion.of(XX) }
+        if (!source && !target) {
+          const toolchain = gradle.match(/languageVersion\s*(?:=|\.set\s*\()\s*JavaLanguageVersion\.of\s*\(\s*(\d+)\s*\)/);
+          if (toolchain) { source = toolchain[1]; target = toolchain[1]; }
+        }
+
+        if (source || target) return { source, target };
+      } catch (_) { /* gradle 파일 읽기 실패 — 무시 */ }
+    }
+  }
+
+  return { source: null, target: null };
+}
+
+/**
  * Windows에서 실행 파일 찾기 (.cmd, .bat, .exe 순서)
  */
 function findWinExe(dir, baseName) {
@@ -1056,7 +1128,14 @@ async function compileAndDeploy(savedFilePath) {
   if (depCp) cpParts.push(depCp);
   cpParts.push(...cfg.classpath);
   const cp    = cpParts.join(cpSep);
-  const cmd   = `"${javaBin}" -encoding UTF-8 -cp "${cp}" -sourcepath "${srcRoot}" -d "${classesDir}" "${savedFilePath}"`;
+
+  // 빌드 도구의 Java 소스/타겟 버전 감지 (HotSwap 바이트코드 호환성)
+  const javaVer = detectJavaVersion(ws);
+  let versionFlags = '';
+  if (javaVer.source) versionFlags += ` -source ${javaVer.source}`;
+  if (javaVer.target) versionFlags += ` -target ${javaVer.target}`;
+
+  const cmd   = `"${javaBin}" -encoding UTF-8${versionFlags} -cp "${cp}" -sourcepath "${srcRoot}" -d "${classesDir}" "${savedFilePath}"`;
 
   log(`[Java] 컴파일: ${fname}`);
   log(`[Java] CMD: ${cmd}`);
@@ -1228,8 +1307,13 @@ async function syncAll() {
       cpParts.push(...cfg.classpath);
       const cp = cpParts.join(cpSep);
 
+      const javaVer = detectJavaVersion(ws);
+      let versionFlags = '';
+      if (javaVer.source) versionFlags += ` -source ${javaVer.source}`;
+      if (javaVer.target) versionFlags += ` -target ${javaVer.target}`;
+
       const fileList = javaFiles.map(f => `"${f}"`).join(' ');
-      const cmd = `"${javaBin}" -encoding UTF-8 -cp "${cp}" -sourcepath "${srcRoot}" -d "${classesDir}" ${fileList}`;
+      const cmd = `"${javaBin}" -encoding UTF-8${versionFlags} -cp "${cp}" -sourcepath "${srcRoot}" -d "${classesDir}" ${fileList}`;
 
       log(`[Sync] Java ${javaFiles.length}개 파일 컴파일...`);
       try {
