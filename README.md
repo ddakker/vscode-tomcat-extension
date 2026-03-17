@@ -1,83 +1,165 @@
 # Tomcat Auto Deploy
 
-Java 파일을 저장하면 자동으로 컴파일하고, 실행 중인 Tomcat에 즉시 반영하는 VS Code 확장 프로그램입니다.
-Tomcat 재기동이나 컨텍스트 재시작 없이 변경사항이 바로 적용됩니다.
+A VS Code extension that **automatically compiles and deploys** your Java web application to a local Tomcat server every time you save a file — with zero restarts.
 
-## 주요 기능
+Save a `.java` file, and it gets compiled and hot-swapped into the running JVM instantly. Save a `.jsp`, `.html`, `.css`, or `.js` file, and it's copied to the deployment directory right away. No need to restart Tomcat, no need to redeploy the WAR.
 
-- `.java` 저장 → 자동 컴파일 → JDWP HotSwap으로 즉시 반영 (재시작 없음)
-- `.jsp`, `.html`, `.css`, `.js` 등 저장 → 즉시 배포
-- Maven/Gradle 의존성 자동 인식 (classpath, WEB-INF/lib)
-- Tomcat 시작/중지/재시작 상태바 버튼
-- Windows, Linux, macOS 지원
+## How It Works
 
-## 설치
+```
+You save a .java file
+        │
+        ▼
+   javac compiles it
+        │
+        ▼
+   JDWP HotSwap replaces the class
+   in the running JVM (no restart)
+        │
+        ▼
+   Changes are live immediately
+```
+
+For static files (JSP, HTML, CSS, JS, images, etc.), saving simply copies the file to the Tomcat deployment directory — changes are reflected on the next browser refresh.
+
+## Features
+
+- **Instant Java HotSwap** — Compile on save + JDWP class replacement, no Tomcat restart needed
+- **Static file deployment** — JSP, HTML, CSS, JS files are deployed immediately on save
+- **Maven & Gradle support** — Dependencies are automatically resolved and added to the classpath
+- **Java version detection** — Reads `source`/`target` from `pom.xml` or `build.gradle` to ensure bytecode compatibility
+- **Tomcat lifecycle management** — Start, stop, restart, force kill from the status bar or sidebar
+- **Orphan process detection** — Finds Tomcat processes left running from a previous session
+- **Real-time log streaming** — Tomcat stdout and `localhost.log` displayed in dedicated output panels
+- **Cross-platform** — Windows, Linux, macOS
+
+## Installation
 
 ```bash
 npm install -g @vscode/vsce
 vsce package
 ```
 
-VS Code → Extensions → `...` → Install from VSIX
+Then in VS Code: Extensions → `...` → **Install from VSIX**
 
-## 설정
+## Getting Started
 
-최초 활성화 시 `.vscode/settings.json`에 기본 설정이 자동 생성됩니다.
-`catalinaHome`만 설정하면 바로 사용할 수 있습니다.
+### 1. Set `catalinaHome`
 
-명령 팔레트의 `Tomcat: 설정 열기` 또는 사이드바의 설정 버튼을 클릭하면 Workspace Settings GUI가 열립니다.
+On first activation, the extension creates a settings template in `.vscode/settings.json`. You only need to set one thing — the path to your Tomcat installation:
 
 ```json
 {
-  "tomcatAutoDeploy.catalinaHome": "D:/dev/apache-tomcat-9.0.115",
-  "tomcatAutoDeploy.javaHome": "D:/dev/java/jdk-11.0.2"
+  "tomcatAutoDeploy.catalinaHome": "/path/to/apache-tomcat-9.x"
 }
 ```
 
-| 설정 | 필수 | 기본값 | 설명 |
-|------|------|--------|------|
-| `catalinaHome` | **필수** | - | Tomcat 설치 경로 |
-| `javaHome` | 권장 | 환경변수 | JAVA_HOME 경로 |
-| `port` | - | 8080 | HTTP 포트 |
-| `debugPort` | - | 5005 | JPDA 디버그 포트 |
-| `javaSourceRoot` | - | `src/main/java` | Java 소스 루트 |
-| `webContentRoot` | - | `src/main/webapp` | 정적 파일 루트 |
-| `classpath` | - | `[]` | 추가 classpath JAR 경로 |
+### 2. Start Tomcat
 
-## 사용 방법
+Click the **Tomcat** button in the status bar, or run `Tomcat: Start` from the Command Palette (`Ctrl+Shift+P`).
 
-1. `catalinaHome` 설정 후, 상태바의 `▶ Tomcat` 클릭 또는 명령 팔레트에서 `Tomcat: 시작`
-2. Java 파일을 수정하고 저장하면 자동으로 컴파일 및 HotSwap 반영
-3. JSP/HTML/CSS/JS 파일은 저장 즉시 배포
+The extension will:
+1. Initialize a local Tomcat base directory (`.vscode/tomcat/`)
+2. Sync all compiled classes, dependencies, and static files
+3. Start Tomcat in JPDA debug mode (for HotSwap)
+4. Open your browser when Tomcat is ready
 
-### 명령 팔레트 (Ctrl+Shift+P)
+### 3. Edit and Save
 
-| 명령 | 설명 |
-|------|------|
-| `Tomcat: 시작` | Tomcat 기동 |
-| `Tomcat: 중지` | Tomcat 종료 |
-| `Tomcat: 재시작` | 중지 후 재시작 |
-| `Tomcat: 브라우저 열기` | localhost:port 열기 |
-| `Tomcat: Output 보기` | 로그 패널 열기 |
-| `Tomcat: 설정 열기` | 설정 페이지 열기 |
+Just write code and save. That's it.
 
-### 상태바
+- **Java files** → compiled → hot-swapped into the running JVM
+- **JSP / HTML / CSS / JS** → copied to the deployment directory
 
-| 표시 | 의미 |
-|------|------|
-| `▶ Tomcat` | 중지 상태 — 클릭하면 시작 |
-| `■ Tomcat` (주황) | 실행 중 — 클릭하면 중지 |
-| `✓ 배포완료: xxx.java` | 배포 성공 |
-| `✗ 배포실패: xxx.java` (빨강) | 배포 실패 — Output에서 오류 확인 |
+## Settings
 
-## HotSwap 제약사항
+All settings live under `tomcatAutoDeploy.*` in your workspace settings (`.vscode/settings.json`).
 
-- **메서드 본문 변경**: 즉시 반영 (재시작 없음)
-- **구조 변경** (필드/메서드 추가·삭제, 클래스 상속 변경 등): Tomcat 재시작 필요
+You can also open the settings GUI via Command Palette → `Tomcat: Open Settings` or the gear icon in the sidebar.
 
-## 주의사항
+| Setting | Required | Default | Description |
+|---------|----------|---------|-------------|
+| `catalinaHome` | **Yes** | — | Path to your Tomcat installation (CATALINA_HOME) |
+| `javaHome` | Recommended | env var | Path to JDK (uses `JAVA_HOME` if not set) |
+| `port` | | 8080 | Tomcat HTTP port |
+| `debugPort` | | 5005 | JPDA debug port (used for HotSwap) |
+| `redirectPort` | | 8443 | HTTPS redirect port |
+| `contextPath` | | `/` | Web application context path |
+| `javaSourceRoot` | | `src/main/java` | Java source root (relative to workspace) |
+| `webContentRoot` | | `src/main/webapp` | Static files root (relative to workspace) |
+| `classpath` | | `[]` | Additional JAR paths to include in compilation |
+| `javaOpts` | | `""` | Extra JVM options passed to Tomcat |
 
-- `.vscode/tomcat/` 폴더는 `.gitignore`에 추가 권장
-- Maven/Gradle 프로젝트는 servlet-api 등이 자동으로 classpath에 추가됨
-- Maven 프로젝트는 최초 `mvn compile` 실행 필요 (`target/classes` 생성)
-- 컴파일 오류는 Output 채널(`Tomcat Auto Deploy`)에서 확인
+## Commands
+
+Available from the Command Palette (`Ctrl+Shift+P`) and the sidebar:
+
+| Command | Description |
+|---------|-------------|
+| Tomcat: Start | Start Tomcat in debug mode |
+| Tomcat: Stop | Gracefully stop Tomcat |
+| Tomcat: Force Stop | Kill the Tomcat process immediately |
+| Tomcat: Restart | Stop and start Tomcat |
+| Tomcat: Open Browser | Open `http://localhost:{port}` in your browser |
+| Tomcat: Show Output | Show the main log panel |
+| Tomcat: Localhost Log | Show Tomcat's `localhost.log` in a dedicated panel |
+| Tomcat: Open server.xml | Open the generated `server.xml` for editing |
+| Tomcat: Open Settings | Open workspace settings filtered to this extension |
+
+## Status Bar
+
+| Display | Meaning |
+|---------|---------|
+| `▶ Tomcat` | Stopped — click to start |
+| `● Tomcat` (orange) | Running — click to stop |
+| `✔ Deploy: Foo.java` | File compiled and deployed successfully |
+| `✖ Deploy: Foo.java` (red) | Compilation failed — check the Output panel |
+
+## Sidebar
+
+The Tomcat panel in the Activity Bar provides quick access to all server controls, log panels, and settings.
+
+## HotSwap Limitations
+
+JDWP HotSwap is a JVM feature with inherent limitations. Understanding what it can and cannot do will save you from confusion:
+
+**Works (no restart needed):**
+- Changing code inside a method body
+- Modifying log statements, fixing bugs, tweaking logic
+
+**Doesn't work (Tomcat restart required):**
+- Adding or removing methods
+- Adding or removing fields
+- Changing method signatures
+- Changing class hierarchy (extends/implements)
+- Adding or removing lambda expressions (they compile to synthetic methods)
+
+When HotSwap fails, you'll see a warning in the Output panel. Just restart Tomcat to pick up the changes.
+
+## Build Tool Integration
+
+### Maven
+
+- Dependencies are resolved via `mvn dependency:build-classpath` and cached
+- Java `source`/`target` version is read from `pom.xml` (properties or `maven-compiler-plugin` config)
+- Run `mvn compile` once before first use (the extension syncs from `target/classes`)
+- Changing `pom.xml` automatically invalidates the dependency cache
+
+### Gradle
+
+- Dependencies are resolved via a temporary init script that prints `compileClasspath`
+- Java version is read from `sourceCompatibility`/`targetCompatibility` or `javaToolchain`
+- Run `gradle compileJava` once before first use (the extension syncs from `build/classes`)
+- Changing `build.gradle` or `build.gradle.kts` automatically invalidates the dependency cache
+
+### No Build Tool
+
+If there's no `pom.xml` or `build.gradle`, the extension compiles all `.java` files directly with `javac`.
+
+## Good to Know
+
+- The `.vscode/tomcat/` directory is the local Tomcat base — add it to `.gitignore`
+- Tomcat's `servlet-api` and other libraries are automatically included in the classpath
+- Compilation errors are shown in the Output panel (`Tomcat Auto Deploy`)
+- If VS Code crashes, the extension will detect the orphan Tomcat process on next startup and offer to kill it
+- The extension starts Tomcat with `-Dfile.encoding=UTF-8` to prevent encoding issues in logs
