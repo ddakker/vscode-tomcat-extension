@@ -16,7 +16,7 @@ Thumbs.db
 Desktop.ini
 
 # Tomcat runtime
-.tomcat/
+.vscode/tomcat/
 
 # Maven
 target/

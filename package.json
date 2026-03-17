@@ -5,16 +5,21 @@
   "version": "0.0.1",
   "publisher": "your-publisher-name",
   "engines": { "vscode": "^1.74.0" },
+  "icon": "tomcat-logo.png",
   "categories": ["Other"],
   "activationEvents": ["onStartupFinished"],
+  "extensionKind": ["workspace"],
   "main": "./extension.js",
   "contributes": {
     "commands": [
       { "command": "tomcatAutoDeploy.start",       "title": "Tomcat: 시작",           "icon": "$(play)"        },
       { "command": "tomcatAutoDeploy.stop",        "title": "Tomcat: 중지",           "icon": "$(debug-stop)"  },
+      { "command": "tomcatAutoDeploy.forceStop",   "title": "Tomcat: 강제 중지",      "icon": "$(close)"       },
       { "command": "tomcatAutoDeploy.restart",     "title": "Tomcat: 재시작",         "icon": "$(refresh)"     },
       { "command": "tomcatAutoDeploy.openBrowser", "title": "Tomcat: 브라우저 열기",   "icon": "$(globe)"       },
       { "command": "tomcatAutoDeploy.showOutput",  "title": "Tomcat: Output 보기",    "icon": "$(output)"      },
+      { "command": "tomcatAutoDeploy.showLocalhostLog", "title": "Tomcat: Localhost 로그", "icon": "$(file-text)" },
+      { "command": "tomcatAutoDeploy.openServerXml", "title": "Tomcat: server.xml 열기", "icon": "$(file-code)"   },
       { "command": "tomcatAutoDeploy.configure",   "title": "Tomcat: 설정 열기",      "icon": "$(gear)"        }
     ],
     "viewsContainers": {
@@ -22,7 +27,7 @@
         {
           "id": "tomcatExplorer",
           "title": "Tomcat",
-          "icon": "$(server-process)"
+          "icon": "tomcat-icon.svg"
         }
       ]
     },
@@ -31,7 +36,7 @@
         {
           "id": "tomcatServerView",
           "name": "서버",
-          "icon": "$(server-process)",
+          "icon": "tomcat-icon.svg",
           "contextualTitle": "Tomcat 서버"
         }
       ]
@@ -39,9 +44,10 @@
     "menus": {
       "view/title": [
         { "command": "tomcatAutoDeploy.start",   "when": "view == tomcatServerView && !tomcatAutoDeploy.running", "group": "navigation@1" },
-        { "command": "tomcatAutoDeploy.stop",    "when": "view == tomcatServerView && tomcatAutoDeploy.running",  "group": "navigation@1" },
-        { "command": "tomcatAutoDeploy.restart", "when": "view == tomcatServerView && tomcatAutoDeploy.running",  "group": "navigation@2" },
-        { "command": "tomcatAutoDeploy.configure", "when": "view == tomcatServerView", "group": "navigation@3" }
+        { "command": "tomcatAutoDeploy.stop",      "when": "view == tomcatServerView && tomcatAutoDeploy.running",  "group": "navigation@1" },
+        { "command": "tomcatAutoDeploy.forceStop", "when": "view == tomcatServerView && tomcatAutoDeploy.running",  "group": "navigation@2" },
+        { "command": "tomcatAutoDeploy.restart", "when": "view == tomcatServerView && tomcatAutoDeploy.running",  "group": "navigation@3" },
+        { "command": "tomcatAutoDeploy.configure", "when": "view == tomcatServerView", "group": "navigation@4" }
       ]
     },
     "configuration": {
@@ -81,6 +87,22 @@
           "type": "number",
           "default": 5005,
           "description": "JPDA 디버그 포트 (HotSwap 용)"
+        },
+        "tomcatAutoDeploy.redirectPort": {
+          "type": "number",
+          "default": 8443,
+          "description": "HTTPS 리다이렉트 포트 (다중 인스턴스 시 충돌 방지용)"
+        },
+        "tomcatAutoDeploy.contextPath": {
+          "type": "string",
+          "default": "/",
+          "description": "웹 애플리케이션 컨텍스트 경로. 예: / (ROOT), /monitoring, /api"
+        },
+        "tomcatAutoDeploy.javaOpts": {
+          "type": "string",
+          "default": "",
+          "editPresentation": "multilineText",
+          "description": "Tomcat 기동 시 JAVA_OPTS에 추가할 JVM 옵션. 줄바꿈으로 구분하여 입력. 예:\n-Xms512m\n-Xmx1024m\n-Dspring.profiles.active=dev"
         }
       }
     }

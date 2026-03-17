@@ -14,6 +14,9 @@ const execAsync = promisify(exec);
 //  전역 상태
 // ══════════════════════════════════════════════════════════
 let outputChannel;
+let localhostLogChannel;  // localhost.yyyy-MM-dd.log 전용 출력 채널
+let localhostLogWatcher;  // localhost 로그 파일 감시자
+let localhostLogOffset = 0; // 이미 읽은 바이트 오프셋
 let tomcatProcess = null;
 let tomcatRunning = false;
 let orphanPid     = null;   // 이전 세션에서 남은 고아 프로세스 PID
@@ -67,6 +70,11 @@ class TomcatTreeProvider {
       stopItem.command = { command: 'tomcatAutoDeploy.stop', title: '중지' };
       items.push(stopItem);
 
+      const forceStopItem = new vscode.TreeItem('강제 중지', vscode.TreeItemCollapsibleState.None);
+      forceStopItem.iconPath = new vscode.ThemeIcon('close', new vscode.ThemeColor('testing.iconFailed'));
+      forceStopItem.command = { command: 'tomcatAutoDeploy.forceStop', title: '강제 중지' };
+      items.push(forceStopItem);
+
       const restartItem = new vscode.TreeItem('재시작', vscode.TreeItemCollapsibleState.None);
       restartItem.iconPath = new vscode.ThemeIcon('refresh');
       restartItem.command = { command: 'tomcatAutoDeploy.restart', title: '재시작' };
@@ -74,7 +82,7 @@ class TomcatTreeProvider {
 
       const browserItem = new vscode.TreeItem('브라우저 열기', vscode.TreeItemCollapsibleState.None);
       browserItem.iconPath = new vscode.ThemeIcon('globe');
-      browserItem.description = `http://localhost:${cfg.port}`;
+      browserItem.description = `http://localhost:${cfg.port}${cfg.contextPath}`;
       browserItem.command = { command: 'tomcatAutoDeploy.openBrowser', title: '브라우저 열기' };
       items.push(browserItem);
     }
@@ -83,6 +91,18 @@ class TomcatTreeProvider {
     outputItem.iconPath = new vscode.ThemeIcon('output');
     outputItem.command = { command: 'tomcatAutoDeploy.showOutput', title: 'Output 보기' };
     items.push(outputItem);
+
+    const localhostLogItem = new vscode.TreeItem('Localhost 로그', vscode.TreeItemCollapsibleState.None);
+    localhostLogItem.iconPath = new vscode.ThemeIcon('file-text');
+    localhostLogItem.command = { command: 'tomcatAutoDeploy.showLocalhostLog', title: 'Localhost 로그' };
+    localhostLogItem.description = 'localhost.yyyy-MM-dd.log';
+    items.push(localhostLogItem);
+
+    const serverXmlItem = new vscode.TreeItem('server.xml 열기', vscode.TreeItemCollapsibleState.None);
+    serverXmlItem.iconPath = new vscode.ThemeIcon('file-code');
+    serverXmlItem.command = { command: 'tomcatAutoDeploy.openServerXml', title: 'server.xml 열기' };
+    serverXmlItem.description = '.vscode/tomcat/conf';
+    items.push(serverXmlItem);
 
     const settingsItem = new vscode.TreeItem('설정', vscode.TreeItemCollapsibleState.None);
     settingsItem.iconPath = new vscode.ThemeIcon('gear');
@@ -109,10 +129,13 @@ function getConfig() {
     classpath:      cfg.get('classpath', []),
     port:           cfg.get('port', 8080),
     debugPort:      cfg.get('debugPort', 5005),
+    redirectPort:   cfg.get('redirectPort', 8443),
+    contextPath:    cfg.get('contextPath', '/'),
+    javaOpts:       cfg.get('javaOpts', ''),
     // 프로젝트 루트 기준 자동 계산 경로
-    catalinaBase:   path.join(ws, '.tomcat'),
-    webappsRoot:    path.join(ws, '.tomcat', 'webapps', 'ROOT'),
-    confDir:        path.join(ws, '.tomcat', 'conf'),
+    catalinaBase:   path.join(ws, '.vscode', 'tomcat'),
+    warDir:         path.join(ws, '.vscode', 'tomcat', 'war'),
+    confDir:        path.join(ws, '.vscode', 'tomcat', 'conf'),
   };
 }
 
@@ -291,10 +314,10 @@ function detectOrphanProcess() {
 }
 
 // ══════════════════════════════════════════════════════════
-//  .tomcat 디렉토리 초기화
+//  .vscode/tomcat 디렉토리 초기화
 //  - conf/context.xml  : reloadable="false" (JDWP HotSwap 사용)
 //  - conf/server.xml   : CATALINA_BASE 기반 포트/경로 설정
-//  - webapps/ROOT/WEB-INF/classes/ : 컴파일 결과물 경로
+//  - war/WEB-INF/classes/ : 컴파일 결과물 경로
 // ══════════════════════════════════════════════════════════
 function initTomcatBase() {
   const cfg  = getConfig();
@@ -302,12 +325,13 @@ function initTomcatBase() {
 
   // 필수 디렉토리
   for (const d of [
-    'conf',
-    'webapps/ROOT/WEB-INF/classes',
+    'conf', 'webapps',
     'logs', 'work', 'temp',
   ]) {
     fs.mkdirSync(path.join(base, d), { recursive: true });
   }
+  // war 디렉토리 (배포 대상)
+  fs.mkdirSync(path.join(cfg.warDir, 'WEB-INF', 'classes'), { recursive: true });
 
   // ── context.xml ──────────────────────────────────────────
   // reloadable="false" : JDWP HotSwap으로 클래스 교체 (컨텍스트 재시작 없음)
@@ -334,19 +358,11 @@ function initTomcatBase() {
   }
 
   // ── server.xml ───────────────────────────────────────────
+  // 최초 생성만 자동. 이후에는 수동 편집 내용을 보존하고
+  // 설정 UI에서 변경된 port/redirectPort/contextPath만 업데이트
   const serverXml = path.join(cfg.confDir, 'server.xml');
-  let needWriteServerXml = !fs.existsSync(serverXml);
-  // 기존 server.xml의 shutdown 포트가 -1이 아니면 강제 재생성
-  if (!needWriteServerXml) {
-    try {
-      const existing = fs.readFileSync(serverXml, 'utf-8');
-      if (!existing.includes('port="-1"')) {
-        needWriteServerXml = true;
-        log('[Init] server.xml shutdown 포트 수정 필요 → 재생성');
-      }
-    } catch {}
-  }
-  if (needWriteServerXml) {
+  if (!fs.existsSync(serverXml)) {
+    const ctxPath = cfg.contextPath === '/' ? '' : cfg.contextPath;
     fs.writeFileSync(serverXml,
 `<?xml version="1.0" encoding="UTF-8"?>
 <Server port="-1" shutdown="SHUTDOWN">
@@ -366,7 +382,7 @@ function initTomcatBase() {
 
   <Service name="Catalina">
     <Connector port="${cfg.port}" protocol="HTTP/1.1"
-               connectionTimeout="20000" redirectPort="8443"
+               connectionTimeout="20000" redirectPort="${cfg.redirectPort}"
                URIEncoding="UTF-8"/>
 
     <Engine name="Catalina" defaultHost="localhost">
@@ -376,7 +392,9 @@ function initTomcatBase() {
       </Realm>
 
       <Host name="localhost" appBase="webapps"
-            unpackWARs="false" autoDeploy="false" deployOnStartup="true">
+            unpackWARs="false" autoDeploy="false" deployOnStartup="false">
+        <Context path="${ctxPath}" docBase="${cfg.warDir}"
+                 reloadable="false"/>
         <Valve className="org.apache.catalina.valves.AccessLogValve"
                directory="logs" prefix="localhost_access" suffix=".txt"
                pattern="%h %l %u %t &quot;%r&quot; %s %b"/>
@@ -386,6 +404,56 @@ function initTomcatBase() {
 </Server>
 `, 'utf-8');
     log('[Init] server.xml 생성');
+  } else {
+    // 기존 server.xml 보존 — 설정 UI 값(port, redirectPort, contextPath, docBase)만 반영
+    let xml = fs.readFileSync(serverXml, 'utf-8');
+    let changed = false;
+    const ctxPath = cfg.contextPath === '/' ? '' : cfg.contextPath;
+
+    // Connector port 업데이트
+    const newXml1 = xml.replace(
+      /(<Connector\b[^>]*\bport=")(\d+)(")/,
+      (m, pre, oldPort, post) => {
+        if (oldPort !== String(cfg.port)) { changed = true; }
+        return `${pre}${cfg.port}${post}`;
+      }
+    );
+    xml = newXml1;
+
+    // Connector redirectPort 업데이트
+    const newXml2 = xml.replace(
+      /(<Connector\b[^>]*\bredirectPort=")(\d+)(")/,
+      (m, pre, oldPort, post) => {
+        if (oldPort !== String(cfg.redirectPort)) { changed = true; }
+        return `${pre}${cfg.redirectPort}${post}`;
+      }
+    );
+    xml = newXml2;
+
+    // Context path 업데이트
+    const newXml3 = xml.replace(
+      /(<Context\b[^>]*\bpath=")([^"]*)(")/,
+      (m, pre, oldPath, post) => {
+        if (oldPath !== ctxPath) { changed = true; }
+        return `${pre}${ctxPath}${post}`;
+      }
+    );
+    xml = newXml3;
+
+    // Context docBase 업데이트
+    const newXml4 = xml.replace(
+      /(<Context\b[^>]*\bdocBase=")([^"]*)(")/,
+      (m, pre, oldBase, post) => {
+        if (oldBase !== cfg.warDir) { changed = true; }
+        return `${pre}${cfg.warDir}${post}`;
+      }
+    );
+    xml = newXml4;
+
+    if (changed) {
+      fs.writeFileSync(serverXml, xml, 'utf-8');
+      log('[Init] server.xml 설정값 업데이트 (수동 편집 내용 보존)');
+    }
   }
 
   // ── CATALINA_HOME → CATALINA_BASE 필수 파일 복사 ─────────
@@ -401,8 +469,9 @@ function initTomcatBase() {
   }
 
   log(`[Init] CATALINA_BASE = ${base}`);
-  log(`[Init] webapps/ROOT  = ${cfg.webappsRoot}`);
-  log(`[Init] PORT          = ${cfg.port}`);
+  log(`[Init] WAR 디렉토리  = ${cfg.warDir}`);
+  log(`[Init] contextPath   = ${cfg.contextPath}`);
+  log(`[Init] PORT          = ${cfg.port} (redirect: ${cfg.redirectPort})`);
 }
 
 
@@ -459,6 +528,7 @@ async function startTomcat() {
     JPDA_ADDRESS:   `localhost:${cfg.debugPort}`,
     JPDA_TRANSPORT: 'dt_socket',
     JPDA_SUSPEND:   'n',
+    JAVA_OPTS:      (cfg.javaOpts || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean).join(' '),
     CATALINA_OPTS:  `${utf8Opts} ${prevOpts}`.trim(),
   };
 
@@ -481,6 +551,7 @@ async function startTomcat() {
     tomcatProcess = null;
     orphanPid = null;
     removePidFile();
+    stopLocalhostLogWatch();
     refreshTomcatBar('stopped');
     log(`[Tomcat] 종료 (code=${code})`);
   });
@@ -489,13 +560,14 @@ async function startTomcat() {
     await waitForTomcat(cfg.port, 30000);
     tomcatRunning = true;
     refreshTomcatBar('running');
+    startLocalhostLogWatch();
     vscode.window.showInformationMessage(
-      `✅ Tomcat 시작 완료 → http://localhost:${cfg.port}`,
+      `✅ Tomcat 시작 완료 → http://localhost:${cfg.port}${cfg.contextPath}`,
       '브라우저 열기'
     ).then(sel => {
-      if (sel) vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${cfg.port}`));
+      if (sel) vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${cfg.port}${cfg.contextPath}`));
     });
-    log(`[Tomcat] 기동 완료 → http://localhost:${cfg.port}`);
+    log(`[Tomcat] 기동 완료 → http://localhost:${cfg.port}${cfg.contextPath}`);
   } catch (err) {
     tomcatRunning = false;
     tomcatProcess?.kill();
@@ -591,6 +663,103 @@ async function stopTomcat() {
   }
 }
 
+
+// ══════════════════════════════════════════════════════════
+//  localhost.yyyy-MM-dd.log 실시간 감시
+// ══════════════════════════════════════════════════════════
+function startLocalhostLogWatch() {
+  stopLocalhostLogWatch();
+
+  const cfg = getConfig();
+  const logsDir = path.join(cfg.catalinaBase, 'logs');
+  localhostLogOffset = 0;
+
+  // 현재 날짜 기준 로그 파일 경로
+  function getLogPath() {
+    const d = new Date();
+    const yyyy = d.getFullYear();
+    const mm   = String(d.getMonth() + 1).padStart(2, '0');
+    const dd   = String(d.getDate()).padStart(2, '0');
+    return path.join(logsDir, `localhost.${yyyy}-${mm}-${dd}.log`);
+  }
+
+  function tailLog() {
+    const logPath = getLogPath();
+    if (!fs.existsSync(logPath)) return;
+    const stat = fs.statSync(logPath);
+    if (stat.size <= localhostLogOffset) return;
+
+    const stream = fs.createReadStream(logPath, {
+      start: localhostLogOffset,
+      encoding: 'utf-8',
+    });
+    let buf = '';
+    stream.on('data', chunk => { buf += chunk; });
+    stream.on('end', () => {
+      localhostLogOffset = stat.size;
+      for (const line of buf.split(/\r?\n/)) {
+        if (line.trim()) localhostLogChannel.appendLine(line);
+      }
+    });
+  }
+
+  // logs 디렉토리 감시 (파일 생성/변경)
+  fs.mkdirSync(logsDir, { recursive: true });
+  localhostLogWatcher = fs.watch(logsDir, (eventType, filename) => {
+    if (filename && filename.startsWith('localhost.') && filename.endsWith('.log')) {
+      // 날짜가 바뀌면 오프셋 리셋
+      const currentLog = path.basename(getLogPath());
+      if (filename !== currentLog) return;
+      tailLog();
+    }
+  });
+
+  // 초기 읽기
+  tailLog();
+  log('[Log] localhost 로그 감시 시작');
+}
+
+function stopLocalhostLogWatch() {
+  if (localhostLogWatcher) {
+    localhostLogWatcher.close();
+    localhostLogWatcher = null;
+  }
+  localhostLogOffset = 0;
+}
+
+// ══════════════════════════════════════════════════════════
+//  Tomcat 강제 중지 (즉시 SIGKILL / taskkill /F)
+// ══════════════════════════════════════════════════════════
+async function forceStopTomcat() {
+  if (!tomcatRunning && !orphanPid) {
+    vscode.window.showWarningMessage('Tomcat이 실행 중이 아닙니다.');
+    return;
+  }
+  refreshTomcatBar('stopping');
+  log('[Tomcat] 강제 중지 요청...');
+
+  const pid = orphanPid || (tomcatProcess && tomcatProcess.pid);
+  if (pid) {
+    forceKillPid(pid);
+    log(`[Tomcat] 강제 종료 (PID=${pid})`);
+  }
+
+  if (tomcatProcess) {
+    // exit 이벤트 대기 (최대 5초)
+    await new Promise(resolve => {
+      tomcatProcess.once('exit', resolve);
+      setTimeout(resolve, 5000);
+    });
+  }
+
+  tomcatRunning = false;
+  tomcatProcess = null;
+  orphanPid = null;
+  removePidFile();
+  refreshTomcatBar('stopped');
+  log('[Tomcat] 강제 중지 완료');
+  vscode.window.showInformationMessage('Tomcat을 강제 종료했습니다.');
+}
 
 // ══════════════════════════════════════════════════════════
 //  Maven / Gradle 의존성 classpath 해석
@@ -690,15 +859,15 @@ async function resolveDependencyClasspath() {
   }
 
   const isWin = process.platform === 'win32';
-  fs.mkdirSync(path.join(ws, '.tomcat'), { recursive: true });
-  const cpFile = path.join(ws, '.tomcat', 'dep-classpath.txt');
+  fs.mkdirSync(path.join(ws, '.vscode', 'tomcat'), { recursive: true });
+  const cpFile = path.join(ws, '.vscode', 'tomcat', 'dep-classpath.txt');
 
   try {
     if (buildTool === 'maven') {
       const mvn = findMvnCmd(ws);
       log(`[의존성] Maven classpath 해석 중... (${mvn})`);
       await execAsync(
-        `"${mvn}" dependency:build-classpath -Dmdep.outputFile=.tomcat/dep-classpath.txt -q`,
+        `"${mvn}" dependency:build-classpath -Dmdep.outputFile=.vscode/tomcat/dep-classpath.txt -q`,
         { cwd: ws, timeout: 120000 }
       );
       if (fs.existsSync(cpFile)) {
@@ -712,7 +881,7 @@ async function resolveDependencyClasspath() {
       // Gradle
       const gradleCmd = findGradleCmd(ws);
       log(`[의존성] Gradle classpath 해석 중... (${gradleCmd})`);
-      const initScript = path.join(ws, '.tomcat', 'cp-init.gradle');
+      const initScript = path.join(ws, '.vscode', 'tomcat', 'cp-init.gradle');
       fs.writeFileSync(initScript, `
 allprojects {
   task __printCp {
@@ -862,14 +1031,14 @@ function jdwpHotSwap(port, className, classBytes) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  Java 컴파일 → .tomcat/webapps/ROOT/WEB-INF/classes
+//  Java 컴파일 → .vscode/tomcat/war/WEB-INF/classes
 // ══════════════════════════════════════════════════════════
 async function compileAndDeploy(savedFilePath) {
   const ws = getWorkspaceRoot();
   if (!ws) return;
 
   const cfg        = getConfig();
-  const classesDir = path.join(cfg.webappsRoot, 'WEB-INF', 'classes');
+  const classesDir = path.join(cfg.warDir, 'WEB-INF', 'classes');
   const srcRoot    = path.join(ws, cfg.javaSourceRoot);
   const javaBin    = cfg.javaHome ? path.join(cfg.javaHome, 'bin', 'javac') : 'javac';
   const fname      = path.basename(savedFilePath);
@@ -927,7 +1096,7 @@ async function compileAndDeploy(savedFilePath) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  JSP / Static → .tomcat/webapps/ROOT
+//  JSP / Static → .vscode/tomcat/war
 // ══════════════════════════════════════════════════════════
 async function deployStatic(savedFilePath) {
   const ws = getWorkspaceRoot();
@@ -939,7 +1108,7 @@ async function deployStatic(savedFilePath) {
 
   if (rel.startsWith('..')) return; // 범위 밖
 
-  const dest  = path.join(cfg.webappsRoot, rel);
+  const dest  = path.join(cfg.warDir, rel);
   const fname = path.basename(savedFilePath);
 
   fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -992,6 +1161,27 @@ function copyDirSync(srcDir, destDir) {
   return count;
 }
 
+/**
+ * 디렉토리 전체를 대상 경로에 재귀 복사 (특정 디렉토리 제외)
+ */
+function copyDirSyncWithSkip(srcDir, destDir, skipDirs) {
+  if (!fs.existsSync(srcDir)) return 0;
+  let count = 0;
+  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    const s = path.join(srcDir, entry.name);
+    const d = path.join(destDir, entry.name);
+    if (entry.isDirectory()) {
+      if (skipDirs && skipDirs.has(s)) continue;
+      count += copyDirSyncWithSkip(s, d, skipDirs);
+    } else {
+      fs.mkdirSync(destDir, { recursive: true });
+      fs.copyFileSync(s, d);
+      count++;
+    }
+  }
+  return count;
+}
+
 async function syncAll() {
   const ws = getWorkspaceRoot();
   if (!ws) return;
@@ -999,7 +1189,7 @@ async function syncAll() {
   const cfg        = getConfig();
   const srcRoot    = path.join(ws, cfg.javaSourceRoot);
   const webSrcRoot = path.join(ws, cfg.webContentRoot);
-  const classesDir = path.join(cfg.webappsRoot, 'WEB-INF', 'classes');
+  const classesDir = path.join(cfg.warDir, 'WEB-INF', 'classes');
   const buildTool  = detectBuildTool(ws);
 
   log('[Sync] 전체 동기화 시작...');
@@ -1055,7 +1245,7 @@ async function syncAll() {
   if (buildTool === 'maven' || buildTool === 'gradle') {
     const depCp = await resolveDependencyClasspath();
     if (depCp) {
-      const libDir = path.join(cfg.webappsRoot, 'WEB-INF', 'lib');
+      const libDir = path.join(cfg.warDir, 'WEB-INF', 'lib');
       fs.mkdirSync(libDir, { recursive: true });
       const cpSep  = process.platform === 'win32' ? ';' : ':';
       const jars   = depCp.split(cpSep).filter(p => p.endsWith('.jar') && fs.existsSync(p));
@@ -1075,27 +1265,15 @@ async function syncAll() {
     }
   }
 
-  // ── 3) Static / JSP 전체 복사 ──
-  const staticExts = [
-    '.jsp','.jspx','.html','.htm',
-    '.css','.js','.json','.xml','.properties',
-    '.png','.jpg','.jpeg','.gif','.svg','.ico',
-    '.woff','.woff2','.ttf','.eot',
-  ];
-  const staticFiles = collectFiles(webSrcRoot, staticExts);
-  let copied = 0;
-  for (const src of staticFiles) {
-    const rel  = path.relative(webSrcRoot, src);
-    const dest = path.join(cfg.webappsRoot, rel);
-    try {
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.copyFileSync(src, dest);
-      copied++;
-    } catch (e) {
-      log(`[Sync] 복사 실패: ${rel} → ${e.message}`, 'WARN');
-    }
+  // ── 3) webContentRoot 전체 복사 ──
+  // WEB-INF/classes, WEB-INF/lib는 별도 관리하므로 제외
+  if (fs.existsSync(webSrcRoot)) {
+    const skipDirs = new Set(['classes', 'lib'].map(d =>
+      path.join(webSrcRoot, 'WEB-INF', d)
+    ));
+    const copied = copyDirSyncWithSkip(webSrcRoot, cfg.warDir, skipDirs);
+    if (copied > 0) log(`[Sync] webContentRoot 전체 복사 (${copied}개 파일)`);
   }
-  if (copied > 0) log(`[Sync] 정적 파일 ${copied}개 복사 완료`);
 
   log('[Sync] 전체 동기화 완료');
 }
@@ -1112,13 +1290,14 @@ async function onSaved(doc) {
     return;
   }
 
-  const statics = [
-    '.jsp','.jspx','.html','.htm',
-    '.css','.js','.json','.xml','.properties',
-    '.png','.jpg','.jpeg','.gif','.svg','.ico',
-    '.woff','.woff2','.ttf','.eot',
-  ];
-  if (statics.includes(ext)) await deployStatic(fp);
+  // webContentRoot 하위 파일이면 확장자 무관하게 배포
+  const ws = getWorkspaceRoot();
+  if (ws) {
+    const cfg = getConfig();
+    const webSrcRoot = path.join(ws, cfg.webContentRoot);
+    const rel = path.relative(webSrcRoot, fp);
+    if (!rel.startsWith('..')) await deployStatic(fp);
+  }
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1151,9 +1330,12 @@ async function ensureWorkspaceSettings() {
   settings['tomcatAutoDeploy.javaHome'] = '';
   settings['tomcatAutoDeploy.port'] = 8080;
   settings['tomcatAutoDeploy.debugPort'] = 5005;
+  settings['tomcatAutoDeploy.redirectPort'] = 8443;
+  settings['tomcatAutoDeploy.contextPath'] = '/';
   settings['tomcatAutoDeploy.javaSourceRoot'] = 'src/main/java';
   settings['tomcatAutoDeploy.webContentRoot'] = 'src/main/webapp';
   settings['tomcatAutoDeploy.classpath'] = [];
+  settings['tomcatAutoDeploy.javaOpts'] = '';
 
   fs.mkdirSync(vscodeDir, { recursive: true });
   fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2), 'utf-8');
@@ -1170,6 +1352,7 @@ async function ensureWorkspaceSettings() {
 // ══════════════════════════════════════════════════════════
 function activate(context) {
   outputChannel = vscode.window.createOutputChannel('Tomcat Auto Deploy');
+  localhostLogChannel = vscode.window.createOutputChannel('Tomcat Localhost Log');
   outputChannel.show(true);
 
   let buildTime = '개발 모드';
@@ -1212,10 +1395,21 @@ function activate(context) {
   const cmds = {
     'tomcatAutoDeploy.start':       startTomcat,
     'tomcatAutoDeploy.stop':        stopTomcat,
+    'tomcatAutoDeploy.forceStop':   forceStopTomcat,
     'tomcatAutoDeploy.restart':     async () => { await stopTomcat(); await new Promise(r => setTimeout(r, 2000)); await startTomcat(); },
-    'tomcatAutoDeploy.openBrowser': () => vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${getConfig().port}`)),
+    'tomcatAutoDeploy.openBrowser': () => { const c = getConfig(); vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${c.port}${c.contextPath}`)); },
     'tomcatAutoDeploy.showOutput':  () => outputChannel.show(),
+    'tomcatAutoDeploy.showLocalhostLog': () => localhostLogChannel.show(),
     'tomcatAutoDeploy.configure':   () => vscode.commands.executeCommand('workbench.action.openWorkspaceSettings', { query: 'tomcatAutoDeploy' }),
+    'tomcatAutoDeploy.openServerXml': () => {
+      const cfg = getConfig();
+      const serverXml = path.join(cfg.confDir, 'server.xml');
+      if (fs.existsSync(serverXml)) {
+        vscode.window.showTextDocument(vscode.Uri.file(serverXml));
+      } else {
+        vscode.window.showWarningMessage('server.xml이 아직 생성되지 않았습니다. Tomcat을 한 번 시작해주세요.');
+      }
+    },
   };
 
   for (const [id, fn] of Object.entries(cmds)) {
@@ -1243,6 +1437,7 @@ function activate(context) {
 }
 
 function deactivate() {
+  stopLocalhostLogWatch();
   if (tomcatProcess && tomcatProcess.pid) {
     if (process.platform === 'win32') {
       try { require('child_process').execSync(`taskkill /F /T /PID ${tomcatProcess.pid}`, { stdio: 'ignore', shell: true }); } catch {}

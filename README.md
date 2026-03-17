@@ -77,7 +77,7 @@ VS Code → Extensions → `...` → Install from VSIX
 
 ## 주의사항
 
-- `.tomcat/` 폴더는 `.gitignore`에 추가 권장
+- `.vscode/tomcat/` 폴더는 `.gitignore`에 추가 권장
 - Maven/Gradle 프로젝트는 servlet-api 등이 자동으로 classpath에 추가됨
 - Maven 프로젝트는 최초 `mvn compile` 실행 필요 (`target/classes` 생성)
 - 컴파일 오류는 Output 채널(`Tomcat Auto Deploy`)에서 확인

@@ -1,4 +1,4 @@
-.tomcat/**
+.vscode/tomcat/**
 .claude/**
 .gitignore
 CLAUDE.md

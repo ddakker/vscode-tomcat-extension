@@ -12,9 +12,9 @@ Java 파일 저장 시 자동 컴파일 및 로컬 Tomcat 인스턴스에 JDWP H
 
 핵심 흐름:
 1. **활성화** (`onStartupFinished`): 명령어, 상태바 아이템, `onDidSaveTextDocument` 리스너, 빌드 파일 변경 감시자 등록, `ensureWorkspaceSettings()`로 `.vscode/settings.json` 초기화
-2. **Tomcat 기동** (`startTomcat`): CATALINA_BASE 기준 기존 Java 프로세스 감지(`findProcessByCatalinaBase`) → `initTomcatBase()`로 `.tomcat/` 디렉토리 초기화 → `syncAll()` 전체 동기화 → `catalina.bat/sh jpda run` (JDWP 디버그 모드, 기본 포트 5005)
+2. **Tomcat 기동** (`startTomcat`): CATALINA_BASE 기준 기존 Java 프로세스 감지(`findProcessByCatalinaBase`) → `initTomcatBase()`로 `.vscode/tomcat/` 디렉토리 초기화 → `syncAll()` 전체 동기화 → `catalina.bat/sh jpda run` (JDWP 디버그 모드, 기본 포트 5005)
 3. **저장 시 `.java`** (`compileAndDeploy`): `javac` 컴파일 (Tomcat lib + Maven/Gradle 의존성 자동 classpath) → `.class`를 `WEB-INF/classes/`에 배치 → Tomcat 실행 중이면 JDWP HotSwap으로 해당 클래스만 교체
-4. **저장 시 정적 파일** (`deployStatic`): `.jsp`, `.html`, `.css`, `.js` 등 → `webContentRoot` 기준 상대경로 유지하여 `.tomcat/webapps/ROOT/`에 복사
+4. **저장 시 정적 파일** (`deployStatic`): `.jsp`, `.html`, `.css`, `.js` 등 → `webContentRoot` 기준 상대경로 유지하여 `.vscode/tomcat/webapps/ROOT/`에 복사
 5. **Tomcat 중지** (`stopTomcat`): Windows `taskkill /F /T`, Unix `SIGTERM` → 프로세스 exit 대기 (최대 10초) → 3초 후 미종료 시 `SIGKILL`
 
 ## 개발 명령어
@@ -29,9 +29,9 @@ vsce package
 
 테스트, 린터 설정, 빌드 단계가 없음. `extension.js`에서 직접 실행됨.
 
-## `.tomcat/` 디렉토리 구조 (`initTomcatBase`)
+## `.vscode/tomcat/` 디렉토리 구조 (`initTomcatBase`)
 
-`CATALINA_BASE`를 `{workspace}/.tomcat/`으로 설정. 최초 기동 시 자동 생성:
+`CATALINA_BASE`를 `{workspace}/.vscode/tomcat/`으로 설정. 최초 기동 시 자동 생성:
 - `conf/context.xml` — `reloadable="false"` (JDWP HotSwap 사용, 디스크 감시 비활성화)
 - `conf/server.xml` — `<Server port="-1">` (shutdown 포트 비활성화), HTTP 포트는 설정값 사용. 기존 server.xml에 `port="-1"`이 없으면 재생성. 기존 context.xml에 `reloadable="true"`가 있으면 재생성
 - `conf/web.xml`, `conf/logging.properties` — `CATALINA_HOME`에서 복사
@@ -59,8 +59,8 @@ Manager 앱, `tomcat-users.xml` 생성, 심볼릭 링크 등은 사용하지 않
 3. Maven/Gradle 의존성 (자동 해석, 캐시됨)
 4. 사용자 수동 `classpath` 설정
 
-**Maven**: `mvn dependency:build-classpath -Dmdep.outputFile=.tomcat/dep-classpath.txt`
-**Gradle**: init script(`cp-init.gradle`)로 `compileClasspath` resolve → `.tomcat/dep-classpath.txt`
+**Maven**: `mvn dependency:build-classpath -Dmdep.outputFile=.vscode/tomcat/dep-classpath.txt`
+**Gradle**: init script(`cp-init.gradle`)로 `compileClasspath` resolve → `.vscode/tomcat/dep-classpath.txt`
 
 빌드 도구 실행 파일 탐색 순서 (`findMvnCmd`/`findGradleCmd`):
 1. 프로젝트 Wrapper (`mvnw`/`gradlew`) — Windows에서 `findWinExe()`로 `.cmd`/`.bat`/`.exe` 순서 시도
