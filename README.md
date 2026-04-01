@@ -110,7 +110,7 @@ All settings live under `tomcatAutoDeploy.*` in your workspace settings (`.vscod
 
 You can also open the settings GUI via Command Palette → `Tomcat: Open Settings` or the gear icon in the sidebar.
 
-![Settings](docs/img/config.png)
+![Settings](config.png)
 
 | Setting | Required | Default | Description |
 |---------|----------|---------|-------------|

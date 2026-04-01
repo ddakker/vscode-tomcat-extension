@@ -110,7 +110,7 @@ code --install-extension tomcat-auto-deploy-0.0.1.vsix
 
 명령 팔레트 → `Tomcat: 설정 열기` 또는 사이드바의 톱니바퀴 아이콘으로도 설정 GUI를 열 수 있습니다.
 
-![설정](docs/img/config.png)
+![설정](config.png)
 
 | 설정 | 필수 | 기본값 | 설명 |
 |------|------|--------|------|
