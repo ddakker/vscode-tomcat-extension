@@ -1,0 +1,8 @@
+.vscode/tomcat/**
+.claude/**
+.gitignore
+CLAUDE.md
+package.sh
+package.bat
+*.vsix
+.idea/**
