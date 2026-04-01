@@ -201,3 +201,7 @@ If there's no `pom.xml` or `build.gradle`, the extension compiles all `.java` fi
 - Compilation errors are shown in the Output panel (`Tomcat Auto Deploy`)
 - If VS Code crashes, the extension will detect the orphan Tomcat process on next startup and offer to kill it
 - The extension starts Tomcat with `-Dfile.encoding=UTF-8` to prevent encoding issues in logs
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).
