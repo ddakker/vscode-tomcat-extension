@@ -200,7 +200,7 @@ If there's no `pom.xml` or `build.gradle`, the extension compiles all `.java` fi
 - Tomcat's `servlet-api` and other libraries are automatically included in the classpath
 - Compilation errors are shown in the Output panel (`Tomcat Auto Deploy`)
 - If VS Code crashes, the extension will detect the orphan Tomcat process on next startup and offer to kill it
-- The extension starts Tomcat with `-Dfile.encoding=UTF-8` to prevent encoding issues in logs
+- `Java Opts` 설정에 `-Dfile.encoding=UTF-8` 등 인코딩 옵션이 기본 포함되어 있습니다 (필요 시 수정 가능)
 
 ## License
 
