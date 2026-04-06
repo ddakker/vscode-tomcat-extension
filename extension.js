@@ -1446,7 +1446,13 @@ async function showPortConflict(port, msgKey) {
 // ══════════════════════════════════════════════════════════
 //  JDWP HotSwap: 클래스 바이트코드 교체 (컨텍스트 재시작 없음)
 // ══════════════════════════════════════════════════════════
-function jdwpHotSwap(port, className, classBytes) {
+/**
+ * JDWP HotSwap — 여러 클래스를 한번에 교체.
+ * @param {number} port - JDWP 디버그 포트
+ * @param {Array<{className: string, classBytes: Buffer}>} classes - 교체할 클래스 목록
+ * @returns {Promise<'ok'|'not_loaded'>}
+ */
+function jdwpHotSwap(port, classes) {
   const net = require('net');
 
   return new Promise((resolve, reject) => {
@@ -1519,24 +1525,36 @@ function jdwpHotSwap(port, className, classBytes) {
         const ids = await send(1, 7, Buffer.alloc(0));
         refTypeIdSize = ids.readInt32BE(12);
 
-        const sig = 'L' + className.replace(/\./g, '/') + ';';
-        const sigBuf = Buffer.alloc(4 + Buffer.byteLength(sig));
-        sigBuf.writeInt32BE(Buffer.byteLength(sig), 0);
-        sigBuf.write(sig, 4);
-        const clsData = await send(1, 2, sigBuf);
-        const count = clsData.readInt32BE(0);
-        if (count === 0) {
+        // 각 클래스의 refTypeId 조회 (JVM에 로드된 것만)
+        const loaded = [];
+        for (const { className, classBytes } of classes) {
+          const sig = 'L' + className.replace(/\./g, '/') + ';';
+          const sigBuf = Buffer.alloc(4 + Buffer.byteLength(sig));
+          sigBuf.writeInt32BE(Buffer.byteLength(sig), 0);
+          sigBuf.write(sig, 4);
+          const clsData = await send(1, 2, sigBuf);
+          const count = clsData.readInt32BE(0);
+          if (count > 0) {
+            loaded.push({ refTypeId: clsData.slice(5, 5 + refTypeIdSize), classBytes });
+          }
+        }
+
+        if (loaded.length === 0) {
           socket.destroy();
           return resolve('not_loaded');
         }
-        const refTypeId = clsData.slice(5, 5 + refTypeIdSize);
 
-        const pkt = Buffer.alloc(4 + refTypeIdSize + 4 + classBytes.length);
+        // RedefineClasses — 로드된 클래스 모두 한번에 교체
+        const totalSize = 4 + loaded.reduce(
+          (sum, e) => sum + refTypeIdSize + 4 + e.classBytes.length, 0);
+        const pkt = Buffer.alloc(totalSize);
         let off = 0;
-        pkt.writeInt32BE(1, off); off += 4;
-        refTypeId.copy(pkt, off);  off += refTypeIdSize;
-        pkt.writeInt32BE(classBytes.length, off); off += 4;
-        classBytes.copy(pkt, off);
+        pkt.writeInt32BE(loaded.length, off); off += 4;
+        for (const { refTypeId, classBytes } of loaded) {
+          refTypeId.copy(pkt, off);  off += refTypeIdSize;
+          pkt.writeInt32BE(classBytes.length, off); off += 4;
+          classBytes.copy(pkt, off); off += classBytes.length;
+        }
 
         await send(1, 18, pkt);
         socket.destroy();
@@ -1602,8 +1620,17 @@ async function compileAndDeploy(savedFilePath) {
 
       if (fs.existsSync(classFile)) {
         try {
-          const classBytes = fs.readFileSync(classFile);
-          const result = await jdwpHotSwap(cfg.debugPort, className, classBytes);
+          // 메인 클래스 + inner class ($1, $2, ...) 모두 수집
+          const baseName = path.basename(savedFilePath, '.java');
+          const classDir = path.dirname(classFile);
+          const swapClasses = [{ className, classBytes: fs.readFileSync(classFile) }];
+          for (const f of fs.readdirSync(classDir)) {
+            if (f.startsWith(baseName + '$') && f.endsWith('.class')) {
+              const innerName = className + '$' + f.slice(baseName.length + 1, -6);
+              swapClasses.push({ className: innerName, classBytes: fs.readFileSync(path.join(classDir, f)) });
+            }
+          }
+          const result = await jdwpHotSwap(cfg.debugPort, swapClasses);
           if (result === 'ok') {
             log(t('logHotSwapOk', savedFilePath));
           } else {
