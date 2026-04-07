@@ -2,7 +2,7 @@
   "name": "tomcat-auto-deploy",
   "displayName": "Tomcat Auto Deploy",
   "description": "%extension.description%",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "publisher": "ddakker",
   "author": {
     "name": "ddakker",
@@ -62,7 +62,7 @@
       "view/title": [
         { "command": "tomcatAutoDeploy.start",   "when": "view == tomcatServerView && !tomcatAutoDeploy.running && !tomcatAutoDeploy.starting", "group": "navigation@1" },
         { "command": "tomcatAutoDeploy.stop",      "when": "view == tomcatServerView && tomcatAutoDeploy.running || view == tomcatServerView && tomcatAutoDeploy.starting",  "group": "navigation@1" },
-        { "command": "tomcatAutoDeploy.forceStop", "when": "view == tomcatServerView && tomcatAutoDeploy.running",  "group": "navigation@2" },
+        { "command": "tomcatAutoDeploy.forceStop", "when": "view == tomcatServerView && tomcatAutoDeploy.running || view == tomcatServerView && tomcatAutoDeploy.starting",  "group": "navigation@2" },
         { "command": "tomcatAutoDeploy.restart", "when": "view == tomcatServerView && tomcatAutoDeploy.running",  "group": "navigation@3" },
         { "command": "tomcatAutoDeploy.configure", "when": "view == tomcatServerView", "group": "navigation@4" }
       ]

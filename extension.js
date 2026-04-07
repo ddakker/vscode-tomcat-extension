@@ -9,6 +9,7 @@ const { exec, spawn } = require('child_process');
 const { promisify }   = require('util');
 
 const execAsync = promisify(exec);
+const VERSION = require('./package.json').version;
 
 // ══════════════════════════════════════════════════════════
 //  i18n
@@ -77,8 +78,8 @@ const messages = {
   catalinaCheck:      ['catalinaHome 설정이 필요합니다. .vscode/settings.json을 확인하세요.',
                        'catalinaHome must be configured. Check .vscode/settings.json.'],
   devMode:            ['개발 모드',           'Dev Mode'],
-  ready:              ['Tomcat Auto Deploy v0.0.1 준비됨 — 상태바에서 ▶/■ 클릭',
-                       'Tomcat Auto Deploy v0.0.1 ready — click ▶/■ in status bar'],
+  ready:              [`Tomcat Auto Deploy v${VERSION} 준비됨 — 상태바에서 ▶/■ 클릭`,
+                       `Tomcat Auto Deploy v${VERSION} ready — click ▶/■ in status bar`],
   btnStart:           ['▶ 시작',             '▶ Start'],
   btnSettings:        ['⚙ 설정',             '⚙ Settings'],
   startupFailed:      ['Tomcat 기동 실패: {0}', 'Tomcat startup failed: {0}'],
@@ -175,8 +176,8 @@ const messages = {
   logSettingsCreated: ['[Init] .vscode/settings.json에 기본 설정 생성',
                        '[Init] Default settings created in .vscode/settings.json'],
   logLogWatch:        ['[Log] localhost 로그 감시 시작', '[Log] Localhost log watch started'],
-  logActivated:       ['Tomcat Auto Deploy v0.0.1 활성화 (빌드: {0})',
-                       'Tomcat Auto Deploy v0.0.1 activated (build: {0})'],
+  logActivated:       [`Tomcat Auto Deploy v${VERSION} 활성화 (빌드: {0})`,
+                       `Tomcat Auto Deploy v${VERSION} activated (build: {0})`],
 
   // JDWP
   jdwpTimeout:        ['JDWP 타임아웃',              'JDWP timeout'],
@@ -854,7 +855,7 @@ function waitForTomcat(port, timeoutMs) {
 //  Tomcat 중지
 // ══════════════════════════════════════════════════════════
 async function stopTomcat() {
-  if (!tomcatRunning && !orphanPid) {
+  if (!tomcatRunning && !orphanPid && !tomcatProcess) {
     vscode.window.showWarningMessage(t('notRunning'));
     return;
   }
@@ -973,7 +974,7 @@ function stopLocalhostLogWatch() {
 //  Tomcat 강제 중지 (즉시 SIGKILL / taskkill /F)
 // ══════════════════════════════════════════════════════════
 async function forceStopTomcat() {
-  if (!tomcatRunning && !orphanPid) {
+  if (!tomcatRunning && !orphanPid && !tomcatProcess) {
     vscode.window.showWarningMessage(t('notRunning'));
     return;
   }
