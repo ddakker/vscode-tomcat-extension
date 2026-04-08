@@ -34,6 +34,9 @@ For static files (JSP, HTML, CSS, JS, images, etc.), saving simply copies the fi
 
 - **Instant Java HotSwap** — Compile on save + JDWP class replacement, no Tomcat restart needed
 - **Static file deployment** — JSP, HTML, CSS, JS files are deployed immediately on save
+- **Incremental compilation** — Only recompiles `.java` files that are newer than their `.class` counterparts
+- **Build & Deploy** — Run `mvn compile` or `gradle classes` first, then deploy (auto-triggered on javac failure at startup)
+- **Generated sources support** — ANTLR, QueryDSL, and other build-tool-generated sources under `target/generated-sources` are automatically included
 - **Maven & Gradle support** — Dependencies are automatically resolved and added to the classpath
 - **Java version detection** — Reads `source`/`target` from `pom.xml` or `build.gradle` to ensure bytecode compatibility
 - **Tomcat lifecycle management** — Start, stop, restart, force kill from the status bar or sidebar
@@ -72,7 +75,7 @@ package.bat
 **Option B) Install from command line:**
 
 ```bash
-code --install-extension tomcat-auto-deploy-0.9.3.vsix
+code --install-extension tomcat-auto-deploy-0.9.4.vsix
 ```
 
 ## Getting Started
@@ -142,6 +145,7 @@ Available from the Command Palette (`Ctrl+Shift+P`) and the sidebar:
 | Tomcat: Localhost Log | Show Tomcat's `localhost.log` in a dedicated panel |
 | Tomcat: Open server.xml | Open the generated `server.xml` for editing |
 | Tomcat: Deploy All | Re-run full sync (`Ctrl+Alt+D`) |
+| Tomcat: Build & Deploy | Run Maven/Gradle compile, then full sync (available when stopped, Maven/Gradle projects only) |
 | Tomcat: Open Settings | Open workspace settings filtered to this extension |
 
 ## Status Bar
@@ -180,14 +184,16 @@ When HotSwap fails, you'll see a warning in the Output panel. Just restart Tomca
 
 - Dependencies are resolved via `mvn dependency:build-classpath` and cached
 - Java `source`/`target` version is read from `pom.xml` (properties or `maven-compiler-plugin` config)
-- Run `mvn compile` once before first use (the extension syncs from `target/classes`)
+- Generated sources under `target/generated-sources/` (ANTLR, QueryDSL, etc.) are automatically included in compilation
+- If javac fails at startup, the extension automatically runs `mvn compile` and retries
 - Changing `pom.xml` automatically invalidates the dependency cache
 
 ### Gradle
 
 - Dependencies are resolved via a temporary init script that prints `compileClasspath`
 - Java version is read from `sourceCompatibility`/`targetCompatibility` or `javaToolchain`
-- Run `gradle compileJava` once before first use (the extension syncs from `build/classes`)
+- Generated sources under `build/generated/sources/` are automatically included in compilation
+- If javac fails at startup, the extension automatically runs `gradle classes` and retries
 - Changing `build.gradle` or `build.gradle.kts` automatically invalidates the dependency cache
 
 ### No Build Tool

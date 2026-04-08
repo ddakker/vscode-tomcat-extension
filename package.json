@@ -2,7 +2,7 @@
   "name": "tomcat-auto-deploy",
   "displayName": "Tomcat Auto Deploy",
   "description": "%extension.description%",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "publisher": "ddakker",
   "author": {
     "name": "ddakker",
@@ -30,7 +30,8 @@
       { "command": "tomcatAutoDeploy.showLocalhostLog", "title": "%command.showLocalhostLog%", "icon": "$(file-text)" },
       { "command": "tomcatAutoDeploy.openServerXml", "title": "%command.openServerXml%",   "icon": "$(file-code)"   },
       { "command": "tomcatAutoDeploy.configure",   "title": "%command.configure%",       "icon": "$(gear)"        },
-      { "command": "tomcatAutoDeploy.deployAll",   "title": "%command.deployAll%",       "icon": "$(cloud-upload)" }
+      { "command": "tomcatAutoDeploy.deployAll",   "title": "%command.deployAll%",       "icon": "$(cloud-upload)" },
+      { "command": "tomcatAutoDeploy.buildAndDeploy", "title": "%command.buildAndDeploy%", "icon": "$(tools)" }
     ],
     "keybindings": [
       {

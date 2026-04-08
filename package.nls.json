@@ -10,6 +10,7 @@
   "command.openServerXml": "Tomcat: Open server.xml",
   "command.configure": "Tomcat: Open Settings",
   "command.deployAll": "Tomcat: Deploy All",
+  "command.buildAndDeploy": "Tomcat: Build & Deploy",
   "view.server": "Server",
   "view.server.contextualTitle": "Tomcat Server",
   "config.javaHome.description": "JDK installation path (uses JAVA_HOME env var if empty)",

@@ -18,7 +18,8 @@ const isKo = vscode.env.language.startsWith('ko');
 
 const messages = {
   // TreeView
-  deployAll:          ['전체 배포',          'Deploy All'],
+  deployAll:          ['배포',              'Deploy All'],
+  buildAndDeploy:     ['빌드 후 배포',       'Build & Deploy'],
   serverRunning:      ['서버 실행 중',       'Server Running'],
   serverStopped:      ['서버 중지됨',        'Server Stopped'],
   port:               ['포트 {0}',          'Port {0}'],
@@ -173,6 +174,11 @@ const messages = {
   logSyncNoChange:    ['[Sync] 변경된 파일 없음',        '[Sync] No files changed'],
   logSyncDone:        ['[Sync] 전체 동기화 완료 (변경 {0}건)',
                        '[Sync] Full sync complete ({0} files changed)'],
+  logBuildStart:      ['[Build] {0} 빌드 시작...',       '[Build] {0} build starting...'],
+  logBuildDone:       ['[Build] {0} 빌드 완료',          '[Build] {0} build complete'],
+  logBuildFail:       ['[Build] 빌드 실패:\n{0}',        '[Build] Build failed:\n{0}'],
+  logAutoFullBuild:   ['[Sync] javac 컴파일 실패 → 전체 빌드/배포 자동 실행',
+                       '[Sync] javac compile failed → auto running full build/deploy'],
   logSettingsCreated: ['[Init] .vscode/settings.json에 기본 설정 생성',
                        '[Init] Default settings created in .vscode/settings.json'],
   logLogWatch:        ['[Log] localhost 로그 감시 시작', '[Log] Localhost log watch started'],
@@ -249,6 +255,17 @@ class TomcatTreeProvider {
     serverItem.description = tomcatRunning ? t('port', cfg.port) : '';
     serverItem.contextValue = tomcatRunning ? 'serverRunning' : 'serverStopped';
     items.push(serverItem);
+
+    // 중지 중일 때: 전체 빌드/배포 버튼
+    if (!tomcatRunning) {
+      const buildTool = detectBuildTool(getWorkspaceRoot());
+      if (buildTool) {
+        const buildItem = new vscode.TreeItem(t('buildAndDeploy'), vscode.TreeItemCollapsibleState.None);
+        buildItem.iconPath = new vscode.ThemeIcon('tools');
+        buildItem.command = { command: 'tomcatAutoDeploy.buildAndDeploy', title: t('buildAndDeploy') };
+        items.push(buildItem);
+      }
+    }
 
     // 실행 중일 때만 표시되는 액션 항목 (시작/중지/재시작/설정은 타이틀바 버튼으로 제공)
     if (tomcatRunning) {
@@ -766,7 +783,11 @@ async function startTomcat() {
 
   initTomcatBase();
 
-  await syncAll();
+  const compileOk = await syncAll();
+  if (compileOk === false && detectBuildTool(getWorkspaceRoot())) {
+    log(t('logAutoFullBuild'));
+    await buildAndDeploy();
+  }
 
   outputChannel.show(true);
 
@@ -1536,9 +1557,14 @@ function jdwpHotSwap(port, classes) {
           const clsData = await send(1, 2, sigBuf);
           const count = clsData.readInt32BE(0);
           if (count > 0) {
+            log(`[HotSwap]   - ${className}: JVM 로드됨 (교체 대상)`);
             loaded.push({ refTypeId: clsData.slice(5, 5 + refTypeIdSize), classBytes });
+          } else {
+            log(`[HotSwap]   - ${className}: JVM 미로드 (스킵)`);
           }
         }
+
+        log(`[HotSwap] JVM 로드 확인: ${classes.length}개 중 ${loaded.length}개 로드됨`);
 
         if (loaded.length === 0) {
           socket.destroy();
@@ -1599,7 +1625,20 @@ async function compileAndDeploy(savedFilePath) {
   const argLines = ['-encoding', 'UTF-8'];
   if (javaVer.source) argLines.push('-source', javaVer.source);
   if (javaVer.target) argLines.push('-target', javaVer.target);
-  argLines.push('-cp', cp, '-sourcepath', srcRoot, '-d', classesDir, savedFilePath);
+  // sourcepath: src + generated-sources
+  const sourcePaths = [srcRoot];
+  const buildTool = detectBuildTool(ws);
+  if (buildTool) {
+    const genBase = buildTool === 'maven'
+      ? path.join(ws, 'target', 'generated-sources')
+      : path.join(ws, 'build', 'generated', 'sources');
+    if (fs.existsSync(genBase)) {
+      for (const entry of fs.readdirSync(genBase, { withFileTypes: true })) {
+        if (entry.isDirectory()) sourcePaths.push(path.join(genBase, entry.name));
+      }
+    }
+  }
+  argLines.push('-cp', cp, '-sourcepath', sourcePaths.join(cpSep), '-d', classesDir, savedFilePath);
 
   const argFile = path.join(ws, '.vscode', 'tomcat', 'javac-args.txt');
   fs.writeFileSync(argFile, argLines.map(a => `"${a.replace(/\\/g, '/')}"`).join('\n'), 'utf-8');
@@ -1625,12 +1664,17 @@ async function compileAndDeploy(savedFilePath) {
           const baseName = path.basename(savedFilePath, '.java');
           const classDir = path.dirname(classFile);
           const swapClasses = [{ className, classBytes: fs.readFileSync(classFile) }];
-          for (const f of fs.readdirSync(classDir)) {
+          const allClassFiles = fs.readdirSync(classDir);
+          log(`[HotSwap] classDir: ${classDir}, baseName: ${baseName}`);
+          log(`[HotSwap] classDir 내 파일: ${allClassFiles.filter(f => f.startsWith(baseName)).join(', ')}`);
+          for (const f of allClassFiles) {
             if (f.startsWith(baseName + '$') && f.endsWith('.class')) {
               const innerName = className + '$' + f.slice(baseName.length + 1, -6);
+              log(`[HotSwap] inner class 발견: ${f} → ${innerName}`);
               swapClasses.push({ className: innerName, classBytes: fs.readFileSync(path.join(classDir, f)) });
             }
           }
+          log(`[HotSwap] 교체 대상 클래스 ${swapClasses.length}개: ${swapClasses.map(c => c.className).join(', ')}`);
           const result = await jdwpHotSwap(cfg.debugPort, swapClasses);
           if (result === 'ok') {
             log(t('logHotSwapOk', savedFilePath));
@@ -1773,10 +1817,51 @@ function copyDirSyncWithSkip(srcDir, destDir, skipDirs, changedFiles) {
 
 async function compileAllJava(ws, cfg, classesDir, depClasspath) {
   const srcRoot  = path.join(ws, cfg.javaSourceRoot);
-  const javaFiles = collectFiles(srcRoot, ['.java']);
-  if (javaFiles.length === 0) return;
+
+  // generated-sources 디렉토리 탐색 (ANTLR, QueryDSL 등 빌드 도구가 생성한 소스)
+  const genSourcesDirs = [];
+  const buildTool = detectBuildTool(ws);
+  if (buildTool) {
+    const genBase = buildTool === 'maven'
+      ? path.join(ws, 'target', 'generated-sources')
+      : path.join(ws, 'build', 'generated', 'sources');
+    if (fs.existsSync(genBase)) {
+      for (const entry of fs.readdirSync(genBase, { withFileTypes: true })) {
+        if (entry.isDirectory()) genSourcesDirs.push(path.join(genBase, entry.name));
+      }
+    }
+  }
+
+  // 소스 파일 수집 (src + generated-sources)
+  const allJavaFiles = collectFiles(srcRoot, ['.java']);
+  for (const genDir of genSourcesDirs) {
+    allJavaFiles.push(...collectFiles(genDir, ['.java']));
+  }
+  if (allJavaFiles.length === 0) return true;
 
   fs.mkdirSync(classesDir, { recursive: true });
+
+  // .class가 .java보다 새로운 파일은 스킵 (변경된 것만 컴파일)
+  const findClassFile = (jf) => {
+    // srcRoot 기준 또는 genSourcesDirs 기준 상대경로로 .class 경로 결정
+    let rel = path.relative(srcRoot, jf);
+    if (rel.startsWith('..')) {
+      for (const genDir of genSourcesDirs) {
+        const r = path.relative(genDir, jf);
+        if (!r.startsWith('..')) { rel = r; break; }
+      }
+    }
+    return path.join(classesDir, rel.replace(/\.java$/, '.class'));
+  };
+  const javaFiles = allJavaFiles.filter(jf => {
+    const classFile = findClassFile(jf);
+    if (!fs.existsSync(classFile)) return true;
+    return fs.statSync(jf).mtimeMs > fs.statSync(classFile).mtimeMs;
+  });
+  if (javaFiles.length === 0) {
+    log(t('logSyncCompileDone', 0));
+    return true;
+  }
 
   const javaBin = cfg.javaHome ? path.join(cfg.javaHome, 'bin', 'javac') : 'javac';
   const cpSep   = process.platform === 'win32' ? ';' : ':';
@@ -1787,9 +1872,6 @@ async function compileAllJava(ws, cfg, classesDir, depClasspath) {
   const cp = cpParts.join(cpSep);
 
   const javaVer = detectJavaVersion(ws);
-  let versionFlags = '';
-  if (javaVer.source) versionFlags += ` -source ${javaVer.source}`;
-  if (javaVer.target) versionFlags += ` -target ${javaVer.target}`;
 
   // javac @argfile 사용 — Windows 명령줄 길이 제한(8191자) 회피
   const argLines = [
@@ -1797,7 +1879,10 @@ async function compileAllJava(ws, cfg, classesDir, depClasspath) {
   ];
   if (javaVer.source) argLines.push('-source', javaVer.source);
   if (javaVer.target) argLines.push('-target', javaVer.target);
-  argLines.push('-cp', cp, '-sourcepath', srcRoot, '-d', classesDir);
+
+  // sourcepath: src + generated-sources
+  const sourcePaths = [srcRoot, ...genSourcesDirs].join(cpSep);
+  argLines.push('-cp', cp, '-sourcepath', sourcePaths, '-d', classesDir);
   javaFiles.forEach(f => argLines.push(f));
 
   const argFile = path.join(ws, '.vscode', 'tomcat', 'javac-args.txt');
@@ -1807,11 +1892,14 @@ async function compileAllJava(ws, cfg, classesDir, depClasspath) {
   const cmd = `"${javaBin}" @"${argFile}"`;
 
   log(t('logSyncCompiling', javaFiles.length));
+  log(`[Sync] $ ${cmd}`);
   try {
     await execAsync(cmd, { maxBuffer: 10 * 1024 * 1024 });
     log(t('logSyncCompileDone', javaFiles.length));
+    return true;
   } catch (err) {
     log(t('logSyncCompileFail', err.message), 'ERROR');
+    return false;
   } finally {
     try { fs.unlinkSync(argFile); } catch {}
   }
@@ -1840,43 +1928,24 @@ async function syncAll() {
   // 익명/내부 클래스($포함) 제외, top-level class만 카운트
   const countTopLevelClasses = dir =>
     collectFiles(dir, ['.class']).filter(f => !path.basename(f, '.class').includes('$')).length;
-  const javaCount     = collectFiles(srcRoot, ['.java']).length;
+  let javaCount = collectFiles(srcRoot, ['.java']).length;
+  // generated-sources도 카운트에 포함
+  if (buildTool) {
+    const genBase = buildTool === 'maven'
+      ? path.join(ws, 'target', 'generated-sources')
+      : path.join(ws, 'build', 'generated', 'sources');
+    if (fs.existsSync(genBase)) {
+      javaCount += collectFiles(genBase, ['.java']).length;
+    }
+  }
   const deployedCount = countTopLevelClasses(classesDir);
 
-  if (buildTool === 'maven' || buildTool === 'gradle') {
-    // Maven/Gradle: 소스 수 vs 배포 class 수 불일치 → 빌드 먼저 안내
-    if (javaCount !== deployedCount) {
-      log(t('logSyncClassCount', javaCount, deployedCount));
-      const toolName = buildTool === 'maven' ? 'Maven' : 'Gradle';
-      vscode.window.showWarningMessage(t('warnBuildFirst', javaCount, deployedCount, toolName));
-    }
-    // 빌드 산출물이 있으면 복사
-    const buildDir = buildTool === 'maven'
-      ? path.join(ws, 'target', 'classes')
-      : path.join(ws, 'build', 'classes');
-    if (fs.existsSync(buildDir)) {
-      fs.mkdirSync(classesDir, { recursive: true });
-      const count = copyDirSync(buildDir, classesDir, allChanged);
-      const msgKey = buildTool === 'maven' ? 'logSyncMaven' : 'logSyncGradle';
-      log(t(msgKey, count));
-    } else {
-      const warnKey = buildTool === 'maven' ? 'logSyncMavenWarn' : 'logSyncGradleWarn';
-      log(t(warnKey), 'WARN');
-      await compileAllJava(ws, cfg, classesDir, depCp);
-    }
-  } else {
-    // 빌드 도구 없음 → 갯수 불일치 시 javac 전체 컴파일
-    if (javaCount !== deployedCount) {
-      log(t('logSyncClassCount', javaCount, deployedCount));
-      vscode.window.showWarningMessage(t('logSyncClassCount', javaCount, deployedCount));
-      await compileAllJava(ws, cfg, classesDir, '');
-      // 컴파일 후 다시 비교 — 여전히 불일치면 주석된 Java 파일 존재 안내
-      const recount = countTopLevelClasses(classesDir);
-      if (javaCount !== recount) {
-        log(t('warnCommentedJava', javaCount, recount), 'WARN');
-        vscode.window.showWarningMessage(t('warnCommentedJava', javaCount, recount));
-      }
-    }
+  // javac 전체 컴파일 (Maven/Gradle도 동일 — HotSwap 일관성을 위해 javac 직접 사용)
+  const compileOk = await compileAllJava(ws, cfg, classesDir, depCp);
+  const recount = countTopLevelClasses(classesDir);
+  if (javaCount !== recount) {
+    log(t('warnCommentedJava', javaCount, recount), 'WARN');
+    vscode.window.showWarningMessage(t('warnCommentedJava', javaCount, recount));
   }
 
   // ── 2) 의존성 JAR → WEB-INF/lib 복사 ──
@@ -1889,7 +1958,7 @@ async function syncAll() {
     for (const jar of jars) {
       const dest = path.join(libDir, path.basename(jar));
       try {
-        if (fs.existsSync(dest) && fs.statSync(jar).size === fs.statSync(dest).size) continue;
+        if (!isFileChanged(jar, dest)) continue;
         fs.copyFileSync(jar, dest);
         allChanged.push(dest);
         jarCount++;
@@ -1928,6 +1997,47 @@ async function syncAll() {
   }
 
   log(t('logSyncDone', allChanged.length));
+  return compileOk;
+}
+
+/**
+ * Maven/Gradle 빌드 후 전체 배포.
+ * 빌드 도구로 컴파일(target/classes 생성) → syncAll(javac 재컴파일 + 정적파일 배포)
+ */
+async function buildAndDeploy() {
+  const ws = getWorkspaceRoot();
+  if (!ws) return;
+
+  const buildTool = detectBuildTool(ws);
+  if (buildTool) {
+    const cfg = getConfig();
+    const javaHome = cfg.javaHome || process.env.JAVA_HOME || '';
+    const env = { ...process.env };
+    if (javaHome) env.JAVA_HOME = javaHome;
+
+    let buildCmd;
+    if (buildTool === 'maven') {
+      const mvn = findMvnCmd(ws);
+      buildCmd = `"${mvn}" compile -f "${path.join(ws, 'pom.xml')}"`;
+    } else {
+      const gradle = findGradleCmd(ws);
+      buildCmd = `"${gradle}" classes -p "${ws}"`;
+    }
+
+    log(t('logBuildStart', buildTool));
+    log(`[Build] $ ${buildCmd}`);
+    try {
+      await execAsync(buildCmd, { cwd: ws, env, maxBuffer: 10 * 1024 * 1024 });
+      log(t('logBuildDone', buildTool));
+    } catch (err) {
+      log(t('logBuildFail', err.message), 'ERROR');
+      vscode.window.showErrorMessage(t('logBuildFail', err.message));
+      return;
+    }
+  }
+
+  initTomcatBase();
+  await syncAll();
 }
 
 // ══════════════════════════════════════════════════════════
@@ -2072,6 +2182,7 @@ function activate(context) {
     'tomcatAutoDeploy.forceStop':   forceStopTomcat,
     'tomcatAutoDeploy.restart':     async () => { await stopTomcat(); await new Promise(r => setTimeout(r, 2000)); await startTomcat(); },
     'tomcatAutoDeploy.deployAll':   async () => { initTomcatBase(); await syncAll(); },
+    'tomcatAutoDeploy.buildAndDeploy': buildAndDeploy,
     'tomcatAutoDeploy.openBrowser': () => { const c = getConfig(); vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${c.port}${c.contextPath}`)); },
     'tomcatAutoDeploy.showOutput':  () => outputChannel.show(),
     'tomcatAutoDeploy.showLocalhostLog': () => localhostLogChannel.show(),
