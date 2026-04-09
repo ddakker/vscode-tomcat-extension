@@ -2044,6 +2044,8 @@ async function buildAndDeploy() {
 //  파일 저장 이벤트
 // ══════════════════════════════════════════════════════════
 async function onSaved(doc) {
+  if (!tomcatRunning) return;
+
   const fp  = doc.uri.fsPath;
   const ext = path.extname(fp).toLowerCase();
 
