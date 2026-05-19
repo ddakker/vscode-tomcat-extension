@@ -211,3 +211,9 @@ If there's no `pom.xml` or `build.gradle`, the extension compiles all `.java` fi
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
+
+## Contact
+- Email: ddakker@gmail.com, ddakker@naver.com
+
+## MS Logging
+- Service Request SIR23555772
