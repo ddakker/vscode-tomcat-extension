@@ -2,7 +2,7 @@
   "name": "tomcat-auto-deploy",
   "displayName": "Tomcat Auto Deploy",
   "description": "%extension.description%",
-  "version": "0.9.4",
+  "version": "0.9.6",
   "publisher": "ddakker",
   "author": {
     "name": "ddakker",

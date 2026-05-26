@@ -170,6 +170,8 @@ const messages = {
                        '[Sync] webContentRoot fully copied ({0} files)'],
   logSyncResource:    ['[Sync] resourceRoot → WEB-INF/classes ({0}개 파일)',
                        '[Sync] resourceRoot → WEB-INF/classes ({0} files)'],
+  logSyncOrphanDeleted: ['[Sync] 소스에 없는 파일 삭제: {0}',
+                       '[Sync] Deleted orphan file: {0}'],
   logSyncChanged:     ['[Sync]   ↳ {0}',               '[Sync]   ↳ {0}'],
   logSyncNoChange:    ['[Sync] 변경된 파일 없음',        '[Sync] No files changed'],
   logSyncDone:        ['[Sync] 전체 동기화 완료 (변경 {0}건)',
@@ -211,9 +213,10 @@ let outputChannel;
 let localhostLogChannel;
 let localhostLogWatcher;
 let localhostLogOffset = 0;
-let tomcatProcess = null;
-let tomcatRunning = false;
-let orphanPid     = null;
+let tomcatProcess  = null;
+let tomcatRunning  = false;
+let tomcatStarting = false;
+let orphanPid      = null;
 let sbTomcat;
 let sbDeploy;
 let cachedDepClasspath = null;
@@ -741,115 +744,138 @@ async function startTomcat() {
     vscode.window.showWarningMessage(t('alreadyRunning'));
     return;
   }
+  if (tomcatStarting) {
+    vscode.window.showWarningMessage(t('alreadyRunning'));
+    return;
+  }
+  tomcatStarting = true;
   refreshTomcatBar('starting');
 
-  const cfg = getConfig();
+  try {
+    const cfg = getConfig();
 
-  const existingPid = findProcessByCatalinaBase(cfg.catalinaBase);
-  if (existingPid) {
-    const sel = await vscode.window.showWarningMessage(
-      t('existingProcess', existingPid),
-      t('forceKillAndStart'), t('cancel')
-    );
-    if (sel === t('forceKillAndStart')) {
-      forceKillPid(existingPid);
-      log(t('logExistingKill', existingPid));
-      await new Promise(r => setTimeout(r, 2000));
-    } else {
+    const existingPid = findProcessByCatalinaBase(cfg.catalinaBase);
+    if (existingPid) {
+      const sel = await vscode.window.showWarningMessage(
+        t('existingProcess', existingPid),
+        t('forceKillAndStart'), t('cancel')
+      );
+      if (sel === t('forceKillAndStart')) {
+        forceKillPid(existingPid);
+        log(t('logExistingKill', existingPid));
+        await new Promise(r => setTimeout(r, 2000));
+      } else {
+        refreshTomcatBar('stopped');
+        return;
+      }
+    }
+
+    if (!cfg.catalinaHome) {
+      const ans = await vscode.window.showErrorMessage(
+        t('catalinaRequired'),
+        t('openSettings')
+      );
+      if (ans) vscode.commands.executeCommand('workbench.action.openSettings', 'tomcatAutoDeploy.catalinaHome');
       refreshTomcatBar('stopped');
       return;
     }
-  }
 
-  if (!cfg.catalinaHome) {
-    const ans = await vscode.window.showErrorMessage(
-      t('catalinaRequired'),
-      t('openSettings')
-    );
-    if (ans) vscode.commands.executeCommand('workbench.action.openSettings', 'tomcatAutoDeploy.catalinaHome');
-    refreshTomcatBar('stopped');
-    return;
-  }
-
-  if (await isPortInUse(cfg.port)) {
-    const killed = await showPortConflict(cfg.port, 'httpPortInUse');
-    if (!killed || await isPortInUse(cfg.port)) { refreshTomcatBar('stopped'); return; }
-  }
-
-  if (await isPortInUse(cfg.debugPort)) {
-    const killed = await showPortConflict(cfg.debugPort, 'debugPortInUse');
-    if (!killed || await isPortInUse(cfg.debugPort)) { refreshTomcatBar('stopped'); return; }
-  }
-
-  initTomcatBase();
-
-  const compileOk = await syncAll();
-  if (compileOk === false && detectBuildTool(getWorkspaceRoot())) {
-    log(t('logAutoFullBuild'));
-    await buildAndDeploy();
-  }
-
-  outputChannel.show(true);
-
-  const isWin    = process.platform === 'win32';
-  const catalina = path.join(cfg.catalinaHome, 'bin', isWin ? 'catalina.bat' : 'catalina.sh');
-  const prevOpts = process.env.CATALINA_OPTS || '';
-  const env = {
-    ...process.env,
-    JAVA_HOME:      cfg.javaHome || process.env.JAVA_HOME || '',
-    CATALINA_HOME:  cfg.catalinaHome,
-    CATALINA_BASE:  cfg.catalinaBase,
-    JPDA_ADDRESS:   `localhost:${cfg.debugPort}`,
-    JPDA_TRANSPORT: 'dt_socket',
-    JPDA_SUSPEND:   'n',
-    JAVA_OPTS:      (cfg.javaOpts || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean).join(' '),
-    CATALINA_OPTS:  prevOpts,
-  };
-
-  log(t('logJpdaStart', cfg.debugPort));
-
-  tomcatProcess = spawn(catalina, ['jpda', 'run'], { env, shell: true, detached: !isWin });
-  if (tomcatProcess.pid) savePid(tomcatProcess.pid);
-  tomcatProcess.stdout.on('data', d => {
-    for (const line of d.toString().split(/\r?\n/)) {
-      if (line.trim()) log(`[OUT] ${line}`);
+    if (await isPortInUse(cfg.port)) {
+      const killed = await showPortConflict(cfg.port, 'httpPortInUse');
+      if (!killed || await isPortInUse(cfg.port)) { refreshTomcatBar('stopped'); return; }
     }
-  });
-  tomcatProcess.stderr.on('data', d => {
-    for (const line of d.toString().split(/\r?\n/)) {
-      if (line.trim()) log(`[ERR] ${line}`, 'WARN');
-    }
-  });
-  tomcatProcess.on('exit', code => {
-    tomcatRunning = false;
-    tomcatProcess = null;
-    orphanPid = null;
-    removePidFile();
-    stopLocalhostLogWatch();
-    refreshTomcatBar('stopped');
-    log(t('logExit', code));
-  });
 
-  try {
-    await waitForTomcat(cfg.port, 30000);
-    tomcatRunning = true;
-    refreshTomcatBar('running');
-    startLocalhostLogWatch();
-    vscode.window.showInformationMessage(
-      t('tomcatStarted', cfg.port, cfg.contextPath),
-      t('openBrowser')
-    ).then(sel => {
-      if (sel) vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${cfg.port}${cfg.contextPath}`));
+    if (await isPortInUse(cfg.debugPort)) {
+      const killed = await showPortConflict(cfg.debugPort, 'debugPortInUse');
+      if (!killed || await isPortInUse(cfg.debugPort)) { refreshTomcatBar('stopped'); return; }
+    }
+
+    initTomcatBase();
+
+    const compileOk = await syncAll();
+    if (compileOk === false && detectBuildTool(getWorkspaceRoot())) {
+      log(t('logAutoFullBuild'));
+      await buildAndDeploy();
+    }
+
+    // 동기화 중 stop을 눌러 starting이 해제됐다면 spawn하지 않고 종료
+    if (!tomcatStarting) {
+      refreshTomcatBar('stopped');
+      return;
+    }
+
+    outputChannel.show(true);
+
+    const isWin    = process.platform === 'win32';
+    const catalina = path.join(cfg.catalinaHome, 'bin', isWin ? 'catalina.bat' : 'catalina.sh');
+    const prevOpts = process.env.CATALINA_OPTS || '';
+    const env = {
+      ...process.env,
+      JAVA_HOME:      cfg.javaHome || process.env.JAVA_HOME || '',
+      CATALINA_HOME:  cfg.catalinaHome,
+      CATALINA_BASE:  cfg.catalinaBase,
+      JPDA_ADDRESS:   `localhost:${cfg.debugPort}`,
+      JPDA_TRANSPORT: 'dt_socket',
+      JPDA_SUSPEND:   'n',
+      JAVA_OPTS:      (cfg.javaOpts || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean).join(' '),
+      CATALINA_OPTS:  prevOpts,
+    };
+
+    log(t('logJpdaStart', cfg.debugPort));
+
+    tomcatProcess = spawn(catalina, ['jpda', 'run'], { env, shell: true, detached: !isWin });
+    if (tomcatProcess.pid) savePid(tomcatProcess.pid);
+    tomcatProcess.stdout.on('data', d => {
+      for (const line of d.toString().split(/\r?\n/)) {
+        if (line.trim()) log(`[OUT] ${line}`);
+      }
     });
-    log(t('logStarted', cfg.port, cfg.contextPath));
+    tomcatProcess.stderr.on('data', d => {
+      for (const line of d.toString().split(/\r?\n/)) {
+        if (line.trim()) log(`[ERR] ${line}`, 'WARN');
+      }
+    });
+    tomcatProcess.on('exit', code => {
+      tomcatRunning = false;
+      tomcatProcess = null;
+      orphanPid = null;
+      removePidFile();
+      stopLocalhostLogWatch();
+      refreshTomcatBar('stopped');
+      log(t('logExit', code));
+    });
+
+    try {
+      await waitForTomcat(cfg.port, 30000);
+      tomcatRunning = true;
+      refreshTomcatBar('running');
+      startLocalhostLogWatch();
+      vscode.window.showInformationMessage(
+        t('tomcatStarted', cfg.port, cfg.contextPath),
+        t('openBrowser')
+      ).then(sel => {
+        if (sel) vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${cfg.port}${cfg.contextPath}`));
+      });
+      log(t('logStarted', cfg.port, cfg.contextPath));
+    } catch (err) {
+      tomcatRunning = false;
+      tomcatProcess?.kill();
+      tomcatProcess = null;
+      refreshTomcatBar('stopped');
+      log(t('logStartFailed', err.message), 'ERROR');
+      vscode.window.showErrorMessage(t('startupFailed', err.message));
+      outputChannel.show(true);
+    }
   } catch (err) {
     tomcatRunning = false;
     tomcatProcess?.kill();
     tomcatProcess = null;
     refreshTomcatBar('stopped');
-    log(t('logStartFailed', err.message), 'ERROR');
-    vscode.window.showErrorMessage(t('startupFailed', err.message));
+    log(t('logStartFailed', err && err.message || String(err)), 'ERROR');
+    vscode.window.showErrorMessage(t('startupFailed', err && err.message || String(err)));
     outputChannel.show(true);
+  } finally {
+    tomcatStarting = false;
   }
 }
 
@@ -877,6 +903,13 @@ function waitForTomcat(port, timeoutMs) {
 // ══════════════════════════════════════════════════════════
 async function stopTomcat() {
   if (!tomcatRunning && !orphanPid && !tomcatProcess) {
+    if (tomcatStarting) {
+      // 기동 도중(예: syncAll 진행 중) 사용자가 중지를 누른 경우 — startTomcat이 spawn 직전에 빠져나가도록 신호만 보낸다
+      tomcatStarting = false;
+      refreshTomcatBar('stopped');
+      log(t('logStopReq'));
+      return;
+    }
     vscode.window.showWarningMessage(t('notRunning'));
     return;
   }
@@ -996,6 +1029,12 @@ function stopLocalhostLogWatch() {
 // ══════════════════════════════════════════════════════════
 async function forceStopTomcat() {
   if (!tomcatRunning && !orphanPid && !tomcatProcess) {
+    if (tomcatStarting) {
+      tomcatStarting = false;
+      refreshTomcatBar('stopped');
+      log(t('logForceStopReq'));
+      return;
+    }
     vscode.window.showWarningMessage(t('notRunning'));
     return;
   }
@@ -1815,8 +1854,82 @@ function copyDirSyncWithSkip(srcDir, destDir, skipDirs, changedFiles) {
   return count;
 }
 
+/**
+ * 소스에 존재하지 않는 대상 파일/디렉토리 삭제
+ */
+function purgeOrphanFiles(srcDir, destDir, excludeNames, baseDestDir) {
+  if (!fs.existsSync(destDir)) return;
+  const actualBase = baseDestDir || destDir;
+  const srcExists = fs.existsSync(srcDir);
+  const srcNames = srcExists ? new Set(fs.readdirSync(srcDir)) : new Set();
+
+  for (const entry of fs.readdirSync(destDir, { withFileTypes: true })) {
+    if (excludeNames && excludeNames.has(entry.name)) continue;
+
+    const d = path.join(destDir, entry.name);
+    const rel = path.relative(actualBase, d).replace(/\\/g, '/');
+    if (!srcNames.has(entry.name)) {
+      fs.rmSync(d, { recursive: true, force: true });
+      log(t('logSyncOrphanDeleted', rel));
+    } else if (entry.isDirectory()) {
+      purgeOrphanFiles(path.join(srcDir, entry.name), d, null, actualBase);
+    }
+  }
+}
+
+/**
+ * WEB-INF/classes 내의 고아 .class 및 리소스 삭제
+ */
+function purgeOrphanClasses(srcRoot, genSourcesDirs, resSrcRoot, classesDir) {
+  if (!fs.existsSync(classesDir)) return;
+
+  const validRels = new Set();
+  const collectRels = (dir, base, ext) => {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        collectRels(full, base, ext);
+      } else if (!ext || entry.name.endsWith(ext)) {
+        let rel = path.relative(base, full);
+        if (ext === '.java') rel = rel.replace(/\.java$/, '.class');
+        validRels.add(rel.replace(/\\/g, '/'));
+      }
+    }
+  };
+
+  collectRels(srcRoot, srcRoot, '.java');
+  for (const gen of genSourcesDirs) collectRels(gen, gen, '.java');
+  collectRels(resSrcRoot, resSrcRoot);
+
+  const scanAndDelete = (currDir) => {
+    if (!fs.existsSync(currDir)) return;
+    for (const entry of fs.readdirSync(currDir, { withFileTypes: true })) {
+      const full = path.join(currDir, entry.name);
+      const rel = path.relative(classesDir, full).replace(/\\/g, '/');
+
+      if (entry.isDirectory()) {
+        scanAndDelete(full);
+        try {
+          if (fs.readdirSync(full).length === 0) fs.rmdirSync(full);
+        } catch {}
+      } else {
+        const isInner = entry.name.includes('$');
+        const baseRel = isInner ? rel.replace(/\$[^./]+\.class$/, '.class') : rel;
+
+        if (!validRels.has(rel) && !validRels.has(baseRel)) {
+          fs.rmSync(full, { force: true });
+          log(t('logSyncOrphanDeleted', 'WEB-INF/classes/' + rel));
+        }
+      }
+    }
+  };
+  scanAndDelete(classesDir);
+}
+
 async function compileAllJava(ws, cfg, classesDir, depClasspath) {
   const srcRoot  = path.join(ws, cfg.javaSourceRoot);
+  const resSrcRoot = path.join(ws, cfg.resourceRoot);
 
   // generated-sources 디렉토리 탐색 (ANTLR, QueryDSL 등 빌드 도구가 생성한 소스)
   const genSourcesDirs = [];
@@ -1831,6 +1944,9 @@ async function compileAllJava(ws, cfg, classesDir, depClasspath) {
       }
     }
   }
+
+  // 고아 클래스 삭제 (컴파일 전 수행)
+  purgeOrphanClasses(srcRoot, genSourcesDirs, resSrcRoot, classesDir);
 
   // 소스 파일 수집 (src + generated-sources)
   const allJavaFiles = collectFiles(srcRoot, ['.java']);
@@ -1912,6 +2028,7 @@ async function syncAll() {
   const cfg        = getConfig();
   const srcRoot    = path.join(ws, cfg.javaSourceRoot);
   const webSrcRoot = path.join(ws, cfg.webContentRoot);
+  const resSrcRoot = path.join(ws, cfg.resourceRoot);
   const classesDir = path.join(cfg.warDir, 'WEB-INF', 'classes');
   const buildTool  = detectBuildTool(ws);
   const allChanged = [];
@@ -1925,11 +2042,13 @@ async function syncAll() {
   }
 
   // ── 1) Java classes 동기화 ──
+  // javac 전체 컴파일 (Maven/Gradle도 동일 — HotSwap 일관성을 위해 javac 직접 사용)
+  const compileOk = await compileAllJava(ws, cfg, classesDir, depCp);
+
   // 익명/내부 클래스($포함) 제외, top-level class만 카운트
   const countTopLevelClasses = dir =>
     collectFiles(dir, ['.class']).filter(f => !path.basename(f, '.class').includes('$')).length;
   let javaCount = collectFiles(srcRoot, ['.java']).length;
-  // generated-sources도 카운트에 포함
   if (buildTool) {
     const genBase = buildTool === 'maven'
       ? path.join(ws, 'target', 'generated-sources')
@@ -1938,22 +2057,30 @@ async function syncAll() {
       javaCount += collectFiles(genBase, ['.java']).length;
     }
   }
-  const deployedCount = countTopLevelClasses(classesDir);
-
-  // javac 전체 컴파일 (Maven/Gradle도 동일 — HotSwap 일관성을 위해 javac 직접 사용)
-  const compileOk = await compileAllJava(ws, cfg, classesDir, depCp);
   const recount = countTopLevelClasses(classesDir);
   if (javaCount !== recount) {
     log(t('warnCommentedJava', javaCount, recount), 'WARN');
     vscode.window.showWarningMessage(t('warnCommentedJava', javaCount, recount));
   }
 
-  // ── 2) 의존성 JAR → WEB-INF/lib 복사 ──
+  // ── 2) 의존성 JAR → WEB-INF/lib 복사 및 정리 ──
   if (depCp) {
     const libDir = path.join(cfg.warDir, 'WEB-INF', 'lib');
     fs.mkdirSync(libDir, { recursive: true });
     const cpSep  = process.platform === 'win32' ? ';' : ':';
     const jars   = depCp.split(cpSep).filter(p => p.endsWith('.jar') && fs.existsSync(p));
+    const jarNames = new Set(jars.map(p => path.basename(p)));
+
+    // 고아 JAR 삭제
+    if (fs.existsSync(libDir)) {
+      for (const entry of fs.readdirSync(libDir)) {
+        if (entry.endsWith('.jar') && !jarNames.has(entry)) {
+          fs.rmSync(path.join(libDir, entry), { force: true });
+          log(t('logSyncOrphanDeleted', 'WEB-INF/lib/' + entry));
+        }
+      }
+    }
+
     let jarCount = 0;
     for (const jar of jars) {
       const dest = path.join(libDir, path.basename(jar));
@@ -1969,8 +2096,11 @@ async function syncAll() {
     log(t('logSyncJarDone', jarCount, jars.length));
   }
 
-  // ── 3) webContentRoot 전체 복사 ──
+  // ── 3) webContentRoot 전체 복사 및 정리 ──
   if (fs.existsSync(webSrcRoot)) {
+    // 고아 파일 삭제 (WEB-INF는 제외 - 수동/별도 관리됨)
+    purgeOrphanFiles(webSrcRoot, cfg.warDir, new Set(['WEB-INF']));
+
     const skipDirs = new Set(['classes', 'lib'].map(d =>
       path.join(webSrcRoot, 'WEB-INF', d)
     ));
@@ -1978,9 +2108,10 @@ async function syncAll() {
     if (copied > 0) log(t('logSyncWebContent', copied));
   }
 
-  // ── 4) resourceRoot → WEB-INF/classes 복사 ──
-  const resSrcRoot = path.join(ws, cfg.resourceRoot);
+  // ── 4) resourceRoot → WEB-INF/classes 복사 및 정리 ──
   if (fs.existsSync(resSrcRoot)) {
+    // resourceRoot에 대해서는 별도 purge를 하지 않음.
+    // (WEB-INF/classes는 이미 purgeOrphanClasses에서 통합 관리됨)
     const copied = copyDirSync(resSrcRoot, classesDir, allChanged);
     if (copied > 0) log(t('logSyncResource', copied));
   }
