@@ -8,6 +8,7 @@
   "command.showOutput": "Tomcat: Show Output",
   "command.showLocalhostLog": "Tomcat: Localhost Log",
   "command.openServerXml": "Tomcat: Open server.xml",
+  "command.openContextXml": "Tomcat: Open context.xml",
   "command.configure": "Tomcat: Open Settings",
   "command.deployAll": "Tomcat: Deploy All",
   "command.buildAndDeploy": "Tomcat: Build & Deploy",

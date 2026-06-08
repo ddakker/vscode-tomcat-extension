@@ -8,6 +8,7 @@
   "command.showOutput": "Tomcat: Output 보기",
   "command.showLocalhostLog": "Tomcat: Localhost 로그",
   "command.openServerXml": "Tomcat: server.xml 열기",
+  "command.openContextXml": "Tomcat: context.xml 열기",
   "command.configure": "Tomcat: 설정 열기",
   "command.deployAll": "Tomcat: 배포",
   "command.buildAndDeploy": "Tomcat: 빌드 후 배포",

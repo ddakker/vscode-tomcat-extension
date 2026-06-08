@@ -31,6 +31,7 @@ const messages = {
   showOutput:         ['Console 로그',      'Console Log'],
   localhostLog:       ['Localhost 로그',     'Localhost Log'],
   openServerXml:      ['server.xml 열기',   'Open server.xml'],
+  openContextXml:     ['context.xml 열기',  'Open context.xml'],
   settings:           ['설정',              'Settings'],
 
   // Status bar - Tomcat
@@ -299,6 +300,11 @@ class TomcatTreeProvider {
     serverXmlItem.command = { command: 'tomcatAutoDeploy.openServerXml', title: t('openServerXml') };
     items.push(serverXmlItem);
 
+    const contextXmlItem = new vscode.TreeItem(t('openContextXml'), vscode.TreeItemCollapsibleState.None);
+    contextXmlItem.iconPath = new vscode.ThemeIcon('file-code');
+    contextXmlItem.command = { command: 'tomcatAutoDeploy.openContextXml', title: t('openContextXml') };
+    items.push(contextXmlItem);
+
     // .vscode/tomcat 디렉토리 트리
     const tomcatBase = cfg.catalinaBase;
     if (tomcatBase && fs.existsSync(tomcatBase)) {
@@ -402,6 +408,38 @@ function isJavaWebProject() {
 function log(msg, level = 'INFO') {
   const ts = new Date().toLocaleTimeString(isKo ? 'ko-KR' : 'en-US');
   outputChannel.appendLine(`[${ts}] [${level}] ${msg}`);
+}
+
+// 줄 맨 앞이 자체 타임스탬프로 시작하는지 판단 (두 형식 모두 지원)
+//  - 애플리케이션(logback/log4j): 2026-06-05 15:14:45,969
+//  - Tomcat JULI 기본 형식:       05-Jun-2026 15:14:45.969
+const HAS_OWN_TIMESTAMP =
+  /^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}|\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2})/;
+
+// 직전 줄이 원본(자체 날짜) 출력이었는지 — 멀티라인 로그의 연속 줄 판단용
+let tomcatLineRaw = false;
+
+// Tomcat 로그 한 줄을 출력 문자열로 변환
+//  - 자체 날짜로 시작하면 [시각] [레벨] 접두사 없이 원본 그대로
+//  - 직전 줄이 원본이었던 연속 줄(스택트레이스 등)도 원본 그대로 유지
+//  - 그 외(부팅 메시지 등)만 접두사 부착
+function formatTomcatLine(line, level) {
+  if (HAS_OWN_TIMESTAMP.test(line)) {
+    tomcatLineRaw = true;
+  } else if (!tomcatLineRaw) {
+    const ts = new Date().toLocaleTimeString(isKo ? 'ko-KR' : 'en-US');
+    return `[${ts}] [${level}] ${line}`;
+  }
+  return line;
+}
+
+// stdout/stderr 한 청크를 한 번의 append로 출력 (스크롤 튐 방지)
+function logTomcatChunk(data, level) {
+  const lines = [];
+  for (const line of data.toString().split(/\r?\n/)) {
+    if (line.trim()) lines.push(formatTomcatLine(line, level));
+  }
+  if (lines.length) outputChannel.append(lines.join('\n') + '\n');
 }
 
 // ══════════════════════════════════════════════════════════
@@ -751,6 +789,10 @@ async function startTomcat() {
   tomcatStarting = true;
   refreshTomcatBar('starting');
 
+  // 시작 시 기존 출력 패널 로그 비우기
+  outputChannel.clear();
+  localhostLogChannel.clear();
+
   try {
     const cfg = getConfig();
 
@@ -823,18 +865,11 @@ async function startTomcat() {
 
     log(t('logJpdaStart', cfg.debugPort));
 
+    tomcatLineRaw = false;
     tomcatProcess = spawn(catalina, ['jpda', 'run'], { env, shell: true, detached: !isWin });
     if (tomcatProcess.pid) savePid(tomcatProcess.pid);
-    tomcatProcess.stdout.on('data', d => {
-      for (const line of d.toString().split(/\r?\n/)) {
-        if (line.trim()) log(`[OUT] ${line}`);
-      }
-    });
-    tomcatProcess.stderr.on('data', d => {
-      for (const line of d.toString().split(/\r?\n/)) {
-        if (line.trim()) log(`[ERR] ${line}`, 'WARN');
-      }
-    });
+    tomcatProcess.stdout.on('data', d => logTomcatChunk(d, 'INFO'));
+    tomcatProcess.stderr.on('data', d => logTomcatChunk(d, 'WARN'));
     tomcatProcess.on('exit', code => {
       tomcatRunning = false;
       tomcatProcess = null;
@@ -858,6 +893,8 @@ async function startTomcat() {
       });
       log(t('logStarted', cfg.port, cfg.contextPath));
     } catch (err) {
+      // 중지 요청에 의한 취소 — stop/forceStop이 프로세스를 정리하므로 조용히 종료
+      if (err && err.message === '__cancelled__') return;
       tomcatRunning = false;
       tomcatProcess?.kill();
       tomcatProcess = null;
@@ -884,6 +921,11 @@ function waitForTomcat(port, timeoutMs) {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + timeoutMs;
     const check = () => {
+      // 기동 대기 중 사용자가 중지를 누른 경우 즉시 취소
+      if (!tomcatStarting || !tomcatProcess) {
+        reject(new Error('__cancelled__'));
+        return;
+      }
       const req = http.request(
         { hostname: 'localhost', port, path: '/', method: 'HEAD', timeout: 1000 },
         () => resolve()
@@ -913,6 +955,7 @@ async function stopTomcat() {
     vscode.window.showWarningMessage(t('notRunning'));
     return;
   }
+  tomcatStarting = false;  // 기동 대기 중이면 waitForTomcat을 취소시킨다
   refreshTomcatBar('stopping');
   log(t('logStopReq'));
 
@@ -1038,6 +1081,7 @@ async function forceStopTomcat() {
     vscode.window.showWarningMessage(t('notRunning'));
     return;
   }
+  tomcatStarting = false;  // 기동 대기 중이면 waitForTomcat을 취소시킨다
   refreshTomcatBar('stopping');
   log(t('logForceStopReq'));
 
@@ -2327,6 +2371,14 @@ function activate(context) {
         initTomcatBase();
       }
       vscode.window.showTextDocument(vscode.Uri.file(serverXml));
+    },
+    'tomcatAutoDeploy.openContextXml': () => {
+      const cfg = getConfig();
+      const contextXml = path.join(cfg.confDir, 'context.xml');
+      if (!fs.existsSync(contextXml)) {
+        initTomcatBase();
+      }
+      vscode.window.showTextDocument(vscode.Uri.file(contextXml));
     },
   };
 

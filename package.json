@@ -29,6 +29,7 @@
       { "command": "tomcatAutoDeploy.showOutput",  "title": "%command.showOutput%",      "icon": "$(output)"      },
       { "command": "tomcatAutoDeploy.showLocalhostLog", "title": "%command.showLocalhostLog%", "icon": "$(file-text)" },
       { "command": "tomcatAutoDeploy.openServerXml", "title": "%command.openServerXml%",   "icon": "$(file-code)"   },
+      { "command": "tomcatAutoDeploy.openContextXml", "title": "%command.openContextXml%", "icon": "$(file-code)"   },
       { "command": "tomcatAutoDeploy.configure",   "title": "%command.configure%",       "icon": "$(gear)"        },
       { "command": "tomcatAutoDeploy.deployAll",   "title": "%command.deployAll%",       "icon": "$(cloud-upload)" },
       { "command": "tomcatAutoDeploy.buildAndDeploy", "title": "%command.buildAndDeploy%", "icon": "$(tools)" }
