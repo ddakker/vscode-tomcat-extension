@@ -2,7 +2,7 @@
   "name": "tomcat-auto-deploy",
   "displayName": "Tomcat Auto Deploy",
   "description": "%extension.description%",
-  "version": "0.9.6",
+  "version": "0.10.0",
   "publisher": "ddakker",
   "author": {
     "name": "ddakker",
@@ -32,7 +32,12 @@
       { "command": "tomcatAutoDeploy.openContextXml", "title": "%command.openContextXml%", "icon": "$(file-code)"   },
       { "command": "tomcatAutoDeploy.configure",   "title": "%command.configure%",       "icon": "$(gear)"        },
       { "command": "tomcatAutoDeploy.deployAll",   "title": "%command.deployAll%",       "icon": "$(cloud-upload)" },
-      { "command": "tomcatAutoDeploy.buildAndDeploy", "title": "%command.buildAndDeploy%", "icon": "$(tools)" }
+      { "command": "tomcatAutoDeploy.buildAndDeploy", "title": "%command.buildAndDeploy%", "icon": "$(tools)" },
+      { "command": "tomcatAutoDeploy.startAll",    "title": "%command.startAll%",        "icon": "$(run-all)"     },
+      { "command": "tomcatAutoDeploy.stopAll",     "title": "%command.stopAll%",         "icon": "$(stop-circle)" },
+      { "command": "tomcatAutoDeploy.pickInstance", "title": "%command.pickInstance%",   "icon": "$(server)"      },
+      { "command": "tomcatAutoDeploy.addInstance",  "title": "%command.addInstance%",     "icon": "$(add)"         },
+      { "command": "tomcatAutoDeploy.removeInstance", "title": "%command.removeInstance%", "icon": "$(trash)"      }
     ],
     "keybindings": [
       {
@@ -62,11 +67,31 @@
     },
     "menus": {
       "view/title": [
-        { "command": "tomcatAutoDeploy.start",   "when": "view == tomcatServerView && !tomcatAutoDeploy.running && !tomcatAutoDeploy.starting", "group": "navigation@1" },
-        { "command": "tomcatAutoDeploy.stop",      "when": "view == tomcatServerView && tomcatAutoDeploy.running || view == tomcatServerView && tomcatAutoDeploy.starting",  "group": "navigation@1" },
-        { "command": "tomcatAutoDeploy.forceStop", "when": "view == tomcatServerView && tomcatAutoDeploy.running || view == tomcatServerView && tomcatAutoDeploy.starting",  "group": "navigation@2" },
-        { "command": "tomcatAutoDeploy.restart", "when": "view == tomcatServerView && tomcatAutoDeploy.running",  "group": "navigation@3" },
-        { "command": "tomcatAutoDeploy.configure", "when": "view == tomcatServerView", "group": "navigation@4" }
+        { "command": "tomcatAutoDeploy.addInstance", "when": "view == tomcatServerView", "group": "navigation@0" },
+        { "command": "tomcatAutoDeploy.configure", "when": "view == tomcatServerView", "group": "navigation@1" }
+      ],
+      "view/item/context": [
+        { "command": "tomcatAutoDeploy.startAll", "when": "view == tomcatServerView && viewItem == controlHeader", "group": "inline@1" },
+        { "command": "tomcatAutoDeploy.stopAll",  "when": "view == tomcatServerView && viewItem == controlHeader", "group": "inline@2" },
+
+        { "command": "tomcatAutoDeploy.start",       "when": "view == tomcatServerView && viewItem == instanceStopped",  "group": "inline@1" },
+        { "command": "tomcatAutoDeploy.stop",        "when": "view == tomcatServerView && viewItem == instanceStarting", "group": "inline@1" },
+        { "command": "tomcatAutoDeploy.stop",        "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "inline@1" },
+        { "command": "tomcatAutoDeploy.restart",     "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "inline@2" },
+        { "command": "tomcatAutoDeploy.forceStop",   "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "inline@3" },
+        { "command": "tomcatAutoDeploy.openBrowser", "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "inline@4" },
+
+        { "command": "tomcatAutoDeploy.start",       "when": "view == tomcatServerView && viewItem == instanceStopped",  "group": "1_run@1" },
+        { "command": "tomcatAutoDeploy.stop",        "when": "view == tomcatServerView && viewItem == instanceStarting", "group": "1_run@1" },
+        { "command": "tomcatAutoDeploy.stop",        "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "1_run@1" },
+        { "command": "tomcatAutoDeploy.restart",     "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "1_run@2" },
+        { "command": "tomcatAutoDeploy.forceStop",   "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "1_run@3" },
+        { "command": "tomcatAutoDeploy.openBrowser", "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "2_view@1" },
+        { "command": "tomcatAutoDeploy.showOutput",  "when": "view == tomcatServerView && viewItem =~ /^instance/",       "group": "2_view@2" },
+        { "command": "tomcatAutoDeploy.showLocalhostLog", "when": "view == tomcatServerView && viewItem =~ /^instance/",  "group": "2_view@3" },
+        { "command": "tomcatAutoDeploy.openServerXml",  "when": "view == tomcatServerView && viewItem =~ /^instance/",    "group": "3_conf@1" },
+        { "command": "tomcatAutoDeploy.openContextXml", "when": "view == tomcatServerView && viewItem =~ /^instance/",    "group": "3_conf@2" },
+        { "command": "tomcatAutoDeploy.removeInstance", "when": "view == tomcatServerView && viewItem =~ /^instance/",     "group": "9_danger@1" }
       ]
     },
     "configuration": {
@@ -83,6 +108,31 @@
           "type": "string",
           "default": "",
           "description": "%config.catalinaHome.description%"
+        },
+        "tomcatAutoDeploy.instanceName": {
+          "order": 3,
+          "type": "string",
+          "default": "default",
+          "description": "%config.instanceName.description%"
+        },
+        "tomcatAutoDeploy.servers": {
+          "order": 4,
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "required": ["name", "port"],
+            "properties": {
+              "name":         { "type": "string", "description": "%config.servers.name%" },
+              "port":         { "type": "number", "description": "%config.servers.port%" },
+              "debugPort":    { "type": "number", "description": "%config.servers.debugPort%" },
+              "redirectPort": { "type": "number", "description": "%config.servers.redirectPort%" },
+              "javaHome":     { "type": "string", "description": "%config.servers.javaHome%" },
+              "catalinaHome": { "type": "string", "description": "%config.servers.catalinaHome%" },
+              "javaOpts":     { "type": "string", "description": "%config.servers.javaOpts%" }
+            }
+          },
+          "markdownDescription": "%config.servers.markdownDescription%"
         },
         "tomcatAutoDeploy.javaSourceRoot": {
           "order": 10,
@@ -149,6 +199,7 @@
     }
   },
   "scripts": {
+    "test": "node --test",
     "vscode:prepublish": "node -e \"require('fs').writeFileSync('build-info.json', JSON.stringify({ buildTime: new Date().toISOString() }))\""
   },
   "devDependencies": {

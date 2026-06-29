@@ -75,7 +75,7 @@ package.bat
 **Option B) Install from command line:**
 
 ```bash
-code --install-extension tomcat-auto-deploy-0.9.4.vsix
+code --install-extension tomcat-auto-deploy-0.10.0.vsix
 ```
 
 ## Getting Started

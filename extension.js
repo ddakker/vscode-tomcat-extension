@@ -10,6 +10,9 @@ const { promisify }   = require('util');
 
 const execAsync = promisify(exec);
 const VERSION = require('./package.json').version;
+const {
+  makeInstanceConfig, findServerConflicts, flatToServerEntry,
+} = require('./lib/instances');
 
 // ══════════════════════════════════════════════════════════
 //  i18n
@@ -210,17 +213,11 @@ function t(key, ...args) {
 // ══════════════════════════════════════════════════════════
 //  전역 상태
 // ══════════════════════════════════════════════════════════
-let outputChannel;
-let localhostLogChannel;
-let localhostLogWatcher;
-let localhostLogOffset = 0;
-let tomcatProcess  = null;
-let tomcatRunning  = false;
-let tomcatStarting = false;
-let orphanPid      = null;
-let sbTomcat;
-let sbDeploy;
-let cachedDepClasspath = null;
+const instances = new Map();   // name → InstanceState (동시 실행 지원)
+let outputChannel;             // 공통 [Deps]/[Sync]/[Build]/[Init]/[Java] 로그 (유지)
+let sbTomcat;                  // 요약 상태바
+let sbDeploy;                  // 공통 deploy 상태바
+let cachedDepClasspath = null; // 공통 (소스·의존성 공통이므로 유지)
 
 // ══════════════════════════════════════════════════════════
 //  TreeView: 사이드바 Tomcat 서버 뷰
@@ -240,78 +237,125 @@ class TomcatTreeProvider {
     if (element && element.contextValue === 'tomcatDir') {
       return this._getDirChildren(element.resourceUri.fsPath);
     }
+    // 인스턴스 노드의 하위 항목
+    if (element && element.instanceName) {
+      return this._getInstanceChildren(getInstance(element.instanceName));
+    }
     if (element) return [];
 
-    const cfg = getConfig();
-    const items = [];
+    // ── 루트: ① 안내(미설정) → ② 전체 제어 헤더 → ③ 인스턴스들 → ④ 빌드/배포 ──
+    const items  = [];
+    const common = getCommonConfig();
+    const all    = [...instances.values()];
 
-    // 서버 상태 항목
-    const serverItem = new vscode.TreeItem(
-      tomcatRunning ? t('serverRunning') : t('serverStopped'),
+    // ① 빈/최초 상태: catalinaHome 미설정 → 설정 유도
+    if (!common.catalinaHome) {
+      const setup = new vscode.TreeItem(
+        isKo ? '⚙ 먼저 Tomcat 경로를 설정하세요' : '⚙ Configure Tomcat path first',
+        vscode.TreeItemCollapsibleState.None
+      );
+      setup.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('list.warningForeground'));
+      setup.command  = { command: 'tomcatAutoDeploy.configure', title: t('settings') };
+      items.push(setup);
+    }
+
+    // ② 전체 제어 헤더 (인라인 startAll/stopAll)
+    const running = all.filter(i => i.running || i.orphanPid).length;
+    const header = new vscode.TreeItem(
+      isKo ? '전체 제어' : 'All Servers',
       vscode.TreeItemCollapsibleState.None
     );
-    serverItem.iconPath = new vscode.ThemeIcon(
-      tomcatRunning ? 'vm-running' : 'vm-outline',
-      tomcatRunning
-        ? new vscode.ThemeColor('testing.iconPassed')
-        : new vscode.ThemeColor('testing.iconSkipped')
-    );
-    serverItem.description = tomcatRunning ? t('port', cfg.port) : '';
-    serverItem.contextValue = tomcatRunning ? 'serverRunning' : 'serverStopped';
-    items.push(serverItem);
+    header.description  = `${running}/${all.length}`;
+    header.iconPath     = new vscode.ThemeIcon('server-process');
+    header.contextValue = 'controlHeader';
+    header.tooltip      = isKo ? '모두 시작 / 모두 정지' : 'Start All / Stop All';
+    items.push(header);
 
-    // 중지 중일 때: 전체 빌드/배포 버튼
-    if (!tomcatRunning) {
-      const buildTool = detectBuildTool(getWorkspaceRoot());
-      if (buildTool) {
-        const buildItem = new vscode.TreeItem(t('buildAndDeploy'), vscode.TreeItemCollapsibleState.None);
-        buildItem.iconPath = new vscode.ThemeIcon('tools');
-        buildItem.command = { command: 'tomcatAutoDeploy.buildAndDeploy', title: t('buildAndDeploy') };
-        items.push(buildItem);
-      }
+    // ③ 인스턴스 노드
+    for (const inst of all) {
+      items.push(this._makeInstanceItem(inst));
     }
 
-    // 실행 중일 때만 표시되는 액션 항목 (시작/중지/재시작/설정은 타이틀바 버튼으로 제공)
-    if (tomcatRunning) {
-      const deployItem = new vscode.TreeItem(t('deployAll'), vscode.TreeItemCollapsibleState.None);
-      deployItem.iconPath = new vscode.ThemeIcon('cloud-upload');
-      deployItem.command = { command: 'tomcatAutoDeploy.deployAll', title: t('deployAll') };
-      items.push(deployItem);
-
-      const browserItem = new vscode.TreeItem(t('openBrowser'), vscode.TreeItemCollapsibleState.None);
-      browserItem.iconPath = new vscode.ThemeIcon('globe');
-      browserItem.description = `http://localhost:${cfg.port}${cfg.contextPath}`;
-      browserItem.command = { command: 'tomcatAutoDeploy.openBrowser', title: t('openBrowser') };
-      items.push(browserItem);
+    // ④ 배포 파일 — 모든 인스턴스가 공유하는 docBase 디렉토리
+    const sharedWar = all.length ? all[0].warDir : null;
+    if (sharedWar && fs.existsSync(sharedWar)) {
+      items.push(this._makeDirItem(sharedWar, isKo ? '📦 배포 파일 (docBase)' : '📦 Deployed files (docBase)'));
     }
 
-    const outputItem = new vscode.TreeItem(t('showOutput'), vscode.TreeItemCollapsibleState.None);
-    outputItem.iconPath = new vscode.ThemeIcon('output');
-    outputItem.command = { command: 'tomcatAutoDeploy.showOutput', title: t('showOutput') };
-    items.push(outputItem);
-
-    const localhostLogItem = new vscode.TreeItem(t('localhostLog'), vscode.TreeItemCollapsibleState.None);
-    localhostLogItem.iconPath = new vscode.ThemeIcon('file-text');
-    localhostLogItem.command = { command: 'tomcatAutoDeploy.showLocalhostLog', title: t('localhostLog') };
-    items.push(localhostLogItem);
-
-    const serverXmlItem = new vscode.TreeItem(t('openServerXml'), vscode.TreeItemCollapsibleState.None);
-    serverXmlItem.iconPath = new vscode.ThemeIcon('file-code');
-    serverXmlItem.command = { command: 'tomcatAutoDeploy.openServerXml', title: t('openServerXml') };
-    items.push(serverXmlItem);
-
-    const contextXmlItem = new vscode.TreeItem(t('openContextXml'), vscode.TreeItemCollapsibleState.None);
-    contextXmlItem.iconPath = new vscode.ThemeIcon('file-code');
-    contextXmlItem.command = { command: 'tomcatAutoDeploy.openContextXml', title: t('openContextXml') };
-    items.push(contextXmlItem);
-
-    // .vscode/tomcat 디렉토리 트리
-    const tomcatBase = cfg.catalinaBase;
-    if (tomcatBase && fs.existsSync(tomcatBase)) {
-      const dirItem = this._makeDirItem(tomcatBase, 'CATALINA_BASE');
-      items.push(dirItem);
+    // ⑤ 공통 빌드/배포
+    const buildTool = detectBuildTool(getWorkspaceRoot() || '');
+    if (buildTool) {
+      const build = new vscode.TreeItem(
+        isKo ? '🔨 전체 재빌드 후 동기화' : '🔨 Rebuild & Sync All',
+        vscode.TreeItemCollapsibleState.None
+      );
+      build.iconPath = new vscode.ThemeIcon('tools');
+      build.command  = { command: 'tomcatAutoDeploy.buildAndDeploy', title: t('buildAndDeploy') };
+      items.push(build);
     }
 
+    return items;
+  }
+
+  // 인스턴스 1개의 루트 노드 (3-상태 아이콘 + contextValue → 인라인 버튼 제어)
+  _makeInstanceItem(inst) {
+    const item = new vscode.TreeItem(inst.name, vscode.TreeItemCollapsibleState.Collapsed);
+    item.instanceName = inst.name;
+    if (inst.starting) {
+      item.description  = `:${inst.port} ${isKo ? '기동중…' : 'starting…'}`;
+      item.iconPath     = new vscode.ThemeIcon('sync', new vscode.ThemeColor('testing.iconQueued'));
+      item.contextValue = 'instanceStarting';
+    } else if (inst.running || inst.orphanPid) {
+      const st = inst.orphanPid ? (isKo ? '외부 실행' : 'orphan') : (isKo ? '실행중' : 'running');
+      item.description  = `:${inst.port} ${st}`;
+      item.iconPath     = new vscode.ThemeIcon('vm-running', new vscode.ThemeColor('testing.iconPassed'));
+      item.contextValue = 'instanceRunning';
+    } else {
+      item.description  = `:${inst.port} ${isKo ? '정지' : 'stopped'}`;
+      item.iconPath     = new vscode.ThemeIcon('vm-outline', new vscode.ThemeColor('testing.iconSkipped'));
+      item.contextValue = 'instanceStopped';
+    }
+    return item;
+  }
+
+  // 인스턴스 노드의 하위 액션/디렉토리
+  _getInstanceChildren(inst) {
+    if (!inst) return [];
+    const items = [];
+    const arg = { instanceName: inst.name };
+    const ctxPath = inst.contextPath || '/';
+
+    if (inst.running || inst.orphanPid) {
+      const browser = new vscode.TreeItem(t('openBrowser'), vscode.TreeItemCollapsibleState.None);
+      browser.iconPath    = new vscode.ThemeIcon('globe');
+      browser.description = `http://localhost:${inst.port}${ctxPath}`;
+      browser.command     = { command: 'tomcatAutoDeploy.openBrowser', title: t('openBrowser'), arguments: [arg] };
+      items.push(browser);
+    }
+
+    const out = new vscode.TreeItem(t('showOutput'), vscode.TreeItemCollapsibleState.None);
+    out.iconPath = new vscode.ThemeIcon('output');
+    out.command  = { command: 'tomcatAutoDeploy.showOutput', title: t('showOutput'), arguments: [arg] };
+    items.push(out);
+
+    const lh = new vscode.TreeItem(t('localhostLog'), vscode.TreeItemCollapsibleState.None);
+    lh.iconPath = new vscode.ThemeIcon('file-text');
+    lh.command  = { command: 'tomcatAutoDeploy.showLocalhostLog', title: t('localhostLog'), arguments: [arg] };
+    items.push(lh);
+
+    const sx = new vscode.TreeItem(t('openServerXml'), vscode.TreeItemCollapsibleState.None);
+    sx.iconPath = new vscode.ThemeIcon('file-code');
+    sx.command  = { command: 'tomcatAutoDeploy.openServerXml', title: t('openServerXml'), arguments: [arg] };
+    items.push(sx);
+
+    const cx = new vscode.TreeItem(t('openContextXml'), vscode.TreeItemCollapsibleState.None);
+    cx.iconPath = new vscode.ThemeIcon('file-code');
+    cx.command  = { command: 'tomcatAutoDeploy.openContextXml', title: t('openContextXml'), arguments: [arg] };
+    items.push(cx);
+
+    if (inst.catalinaBase && fs.existsSync(inst.catalinaBase)) {
+      items.push(this._makeDirItem(inst.catalinaBase, 'CATALINA_BASE'));
+    }
     return items;
   }
 
@@ -350,29 +394,212 @@ let tomcatTreeProvider;
 // ══════════════════════════════════════════════════════════
 //  설정
 // ══════════════════════════════════════════════════════════
-function getConfig() {
+// 공통 설정 (인스턴스 무관). catalinaHome/javaHome/javaOpts 는 인스턴스 미지정 시 폴백 소스이기도 하다.
+function getCommonConfig() {
   const cfg = vscode.workspace.getConfiguration('tomcatAutoDeploy');
-  const ws  = getWorkspaceRoot() || '';
-  const port = cfg.get('port', 8080);
-  const manualPort = cfg.get('manualPortConfig', false);
-  const portOffset = port - 8080;
   return {
     catalinaHome:   cfg.get('catalinaHome', ''),
     javaHome:       cfg.get('javaHome', ''),
+    javaOpts:       cfg.get('javaOpts', ''),
     javaSourceRoot: cfg.get('javaSourceRoot', 'src/main/java'),
     webContentRoot: cfg.get('webContentRoot', 'src/main/webapp'),
     resourceRoot:   cfg.get('resourceRoot', 'src/main/resources'),
     classpath:      cfg.get('classpath', []),
-    port,
-    manualPortConfig: manualPort,
-    debugPort:    manualPort ? cfg.get('debugPort', 5005) : 5005 + portOffset,
-    redirectPort: manualPort ? cfg.get('redirectPort', 8443) : 8443 + portOffset,
     contextPath:    cfg.get('contextPath', '/'),
-    javaOpts:       cfg.get('javaOpts', ''),
-    catalinaBase:   path.join(ws, '.vscode', 'tomcat'),
-    warDir:         path.join(ws, '.vscode', 'tomcat', 'apps', cfg.get('contextPath', '/').replace(/^\//, '') || 'ROOT'),
-    confDir:        path.join(ws, '.vscode', 'tomcat', 'conf'),
   };
+}
+
+// 기본 인스턴스 이름 (설정에서 읽음, 기본값 "default")
+function getDefaultInstanceName() {
+  const name = vscode.workspace.getConfiguration('tomcatAutoDeploy').get('instanceName', 'default');
+  return (name && typeof name === 'string' && name.trim()) ? name.trim() : 'default';
+}
+
+// 기본 인스턴스 객체 (없으면 null)
+function getDefaultInstance() {
+  return instances.get(getDefaultInstanceName()) || null;
+}
+
+// servers 설정.
+//  - 기본 인스턴스는 "항상" 평면 UI 설정(port/debugPort/redirectPort)으로 구성 → 서버를 추가하지 않으면 이거 하나
+//  - servers 배열은 기본 인스턴스 외의 "추가" 인스턴스 목록 (트리 + 버튼/배열 편집으로 늘어남)
+function getServers() {
+  const cfg = vscode.workspace.getConfiguration('tomcatAutoDeploy');
+  const def = flatToServerEntry({
+    name:             getDefaultInstanceName(),
+    port:             cfg.get('port', 8080),
+    debugPort:        cfg.get('debugPort', 5005),
+    redirectPort:     cfg.get('redirectPort', 8443),
+    manualPortConfig: cfg.get('manualPortConfig', false),
+  });
+  return [def, ...getExtraServers(def.name)];
+}
+
+// servers 배열에서 기본 인스턴스를 제외한 "추가" 인스턴스만 (기본 인스턴스는 평면 설정 소유)
+function getExtraServers(defaultName) {
+  const name = defaultName ?? getDefaultInstanceName();
+  const servers = vscode.workspace.getConfiguration('tomcatAutoDeploy').get('servers', []);
+  if (!Array.isArray(servers)) return [];
+  return servers.filter(s => s && typeof s.name === 'string' && s.name !== name);
+}
+
+// 의존성 캐시 등 인스턴스 공용 디렉토리 (.vscode/tomcat/ 직하)
+function getTomcatRoot() {
+  return path.join(getWorkspaceRoot() || '', '.vscode', 'tomcat');
+}
+function getBuildClassesDir() {
+  return path.join(getTomcatRoot(), '.build', 'classes');
+}
+
+let warnedMixedCatalinaHome = false;
+// 공통 1회 컴파일용 설정. catalinaHome은 첫 인스턴스의 effective 값을 대표로 사용.
+function getCompileConfig(common) {
+  const servers = getServers();
+  let repHome = '';
+  const homes = new Set();
+  for (const s of servers) {
+    const ch = s.catalinaHome ?? common.catalinaHome ?? '';
+    if (ch) { homes.add(ch); if (!repHome) repHome = ch; }
+  }
+  if (!repHome) repHome = common.catalinaHome || '';
+  if (homes.size > 1 && !warnedMixedCatalinaHome) {
+    warnedMixedCatalinaHome = true;
+    log('[Sync] 인스턴스마다 catalinaHome이 다릅니다 — 공통 컴파일은 첫 인스턴스(' +
+        repHome + ') 기준. Tomcat9(javax)/10(jakarta) 혼용 시 일부 인스턴스 컴파일 오류 가능.', 'WARN');
+  }
+  return {
+    javaHome:       common.javaHome,
+    catalinaHome:   repHome,
+    classpath:      common.classpath,
+    javaSourceRoot: common.javaSourceRoot,
+    resourceRoot:   common.resourceRoot,
+  };
+}
+
+// .build/classes → inst.warDir/WEB-INF/classes 복사 + inst classes 고아 정리
+function copyBuildToInstance(inst, common, allChanged) {
+  const ws = getWorkspaceRoot() || '';
+  const buildClassesDir = getBuildClassesDir();
+  const instClassesDir  = path.join(inst.warDir, 'WEB-INF', 'classes');
+  fs.mkdirSync(instClassesDir, { recursive: true });
+
+  // 소스/리소스에 없는 .class·리소스 정리 (인스턴스 classes 기준)
+  const srcRoot    = path.join(ws, common.javaSourceRoot);
+  const resSrcRoot = path.join(ws, common.resourceRoot);
+  const genSourcesDirs = [];
+  const buildTool = detectBuildTool(ws);
+  if (buildTool) {
+    const genBase = buildTool === 'maven'
+      ? path.join(ws, 'target', 'generated-sources')
+      : path.join(ws, 'build', 'generated', 'sources');
+    if (fs.existsSync(genBase)) {
+      for (const e of fs.readdirSync(genBase, { withFileTypes: true })) {
+        if (e.isDirectory()) genSourcesDirs.push(path.join(genBase, e.name));
+      }
+    }
+  }
+  purgeOrphanClasses(srcRoot, genSourcesDirs, resSrcRoot, instClassesDir);
+
+  if (fs.existsSync(buildClassesDir)) {
+    return copyDirSync(buildClassesDir, instClassesDir, allChanged);
+  }
+  return 0;
+}
+
+// 새 InstanceState 생성 (정적 파생 + 런타임 필드)
+function makeInstanceState(server, common, ws) {
+  return {
+    ...makeInstanceConfig(server, common, ws),
+    proc: null, running: false, starting: false, orphanPid: null,
+    logChannel: null, localhostChannel: null, logWatcher: null, logOffset: 0,
+    lineRaw: false,
+  };
+}
+
+function getInstance(name) { return instances.get(name); }
+function runningInstances() { return [...instances.values()].filter(i => i.running || i.orphanPid); }
+function anyRunning()  { return [...instances.values()].some(i => i.running || i.orphanPid); }
+function anyStarting() { return [...instances.values()].some(i => i.starting); }
+
+// 설정(servers) ↔ instances Map 재조정.
+//  - 신규 → 추가
+//  - 제거 → 정지 상태인 것만 Map에서 제거 + 채널/워처 정리
+//  - port 등 변경 → 정지 상태일 때만 갱신 (실행 중이면 보류 후 경고)
+function syncInstances() {
+  const ws     = getWorkspaceRoot() || '';
+  const common = getCommonConfig();
+  const servers = getServers();
+
+  // 이름/포트 충돌 경고
+  for (const w of findServerConflicts(servers, common, ws)) {
+    log(`[Config] ${w}`, 'WARN');
+    vscode.window.showWarningMessage(`Tomcat: ${w}`);
+  }
+
+  const wantNames = new Set();
+  for (const server of servers) {
+    if (!server || !server.name || typeof server.port !== 'number') continue;
+    wantNames.add(server.name);
+    const fresh = makeInstanceState(server, common, ws);
+    const cur = instances.get(server.name);
+    if (!cur) {
+      instances.set(server.name, fresh);
+    } else if (!cur.running && !cur.starting && !cur.orphanPid) {
+      // 정지 상태 → 정적 설정만 갱신 (런타임 필드/채널 보존)
+      Object.assign(cur, {
+        port: fresh.port, debugPort: fresh.debugPort, redirectPort: fresh.redirectPort,
+        catalinaHome: fresh.catalinaHome, javaHome: fresh.javaHome, javaOpts: fresh.javaOpts,
+        contextPath: fresh.contextPath, catalinaBase: fresh.catalinaBase,
+        warDir: fresh.warDir, confDir: fresh.confDir,
+      });
+    } else {
+      // 실행 중 → 변경 보류 (다음 재시작 때 반영)
+      if (cur.port !== fresh.port || cur.debugPort !== fresh.debugPort) {
+        log(`[Config] "${server.name}" 실행 중 — 포트 변경은 다음 재시작 때 반영됩니다.`, 'WARN');
+      }
+    }
+  }
+
+  // 설정에서 사라진 인스턴스 — 정지 상태인 것만 제거
+  for (const [name, inst] of [...instances.entries()]) {
+    if (wantNames.has(name)) continue;
+    if (inst.running || inst.starting || inst.orphanPid) {
+      log(`[Config] "${name}" 설정에서 제거됨 — 실행 중이라 정지 후 반영됩니다.`, 'WARN');
+      continue;
+    }
+    disposeInstanceChannels(inst);
+    instances.delete(name);
+  }
+}
+
+function disposeInstanceChannels(inst) {
+  try { inst.logWatcher && inst.logWatcher.close(); } catch {}
+  inst.logWatcher = null;
+  try { inst.logChannel && inst.logChannel.dispose(); } catch {}
+  try { inst.localhostChannel && inst.localhostChannel.dispose(); } catch {}
+  inst.logChannel = inst.localhostChannel = null;
+}
+
+// 인스턴스 콘솔(stdout/stderr) 채널 — lazy 생성
+function getLogChannel(inst) {
+  if (!inst.logChannel) {
+    inst.logChannel = vscode.window.createOutputChannel(`Tomcat: ${inst.name}`);
+  }
+  return inst.logChannel;
+}
+
+// 인스턴스 localhost 접근 로그 채널 — lazy 생성
+function getLocalhostChannel(inst) {
+  if (!inst.localhostChannel) {
+    inst.localhostChannel = vscode.window.createOutputChannel(`Tomcat Localhost: ${inst.name}`);
+  }
+  return inst.localhostChannel;
+}
+
+// 인스턴스 콘솔 채널에 타임스탬프 로그 한 줄
+function logTo(inst, msg, level = 'INFO') {
+  const ts = new Date().toLocaleTimeString(isKo ? 'ko-KR' : 'en-US');
+  getLogChannel(inst).appendLine(`[${ts}] [${level}] ${msg}`);
 }
 
 function getWorkspaceRoot() {
@@ -416,51 +643,53 @@ function log(msg, level = 'INFO') {
 const HAS_OWN_TIMESTAMP =
   /^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}|\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2})/;
 
-// 직전 줄이 원본(자체 날짜) 출력이었는지 — 멀티라인 로그의 연속 줄 판단용
-let tomcatLineRaw = false;
-
-// Tomcat 로그 한 줄을 출력 문자열로 변환
+// Tomcat 로그 한 줄을 출력 문자열로 변환 (연속 줄 판단은 inst.lineRaw 기반 — 인스턴스별 분리)
 //  - 자체 날짜로 시작하면 [시각] [레벨] 접두사 없이 원본 그대로
 //  - 직전 줄이 원본이었던 연속 줄(스택트레이스 등)도 원본 그대로 유지
 //  - 그 외(부팅 메시지 등)만 접두사 부착
-function formatTomcatLine(line, level) {
+function formatTomcatLine(inst, line, level) {
   if (HAS_OWN_TIMESTAMP.test(line)) {
-    tomcatLineRaw = true;
-  } else if (!tomcatLineRaw) {
+    inst.lineRaw = true;
+  } else if (!inst.lineRaw) {
     const ts = new Date().toLocaleTimeString(isKo ? 'ko-KR' : 'en-US');
     return `[${ts}] [${level}] ${line}`;
   }
   return line;
 }
 
-// stdout/stderr 한 청크를 한 번의 append로 출력 (스크롤 튐 방지)
-function logTomcatChunk(data, level) {
+// stdout/stderr 한 청크를 인스턴스 채널에 한 번의 append로 출력 (스크롤 튐 방지)
+function logTomcatChunk(inst, data, level) {
   const lines = [];
   for (const line of data.toString().split(/\r?\n/)) {
-    if (line.trim()) lines.push(formatTomcatLine(line, level));
+    if (line.trim()) lines.push(formatTomcatLine(inst, line, level));
   }
-  if (lines.length) outputChannel.append(lines.join('\n') + '\n');
+  if (lines.length) getLogChannel(inst).append(lines.join('\n') + '\n');
 }
 
 // ══════════════════════════════════════════════════════════
 //  상태바 - Tomcat 제어
 // ══════════════════════════════════════════════════════════
-function refreshTomcatBar(state) {
-  const map = {
-    stopped:  { text: '$(play) Tomcat',                     tip: t('tipStart'),   bg: undefined,                                               cmd: 'tomcatAutoDeploy.start'  },
-    starting: { text: `$(sync~spin) ${t('textStarting')}`,  tip: t('tipStarting'), bg: undefined,                                               cmd: ''                        },
-    running:  { text: '$(debug-stop) Tomcat',               tip: t('tipStop'),    bg: new vscode.ThemeColor('statusBarItem.warningBackground'), cmd: 'tomcatAutoDeploy.stop'   },
-    stopping: { text: `$(sync~spin) ${t('textStopping')}`,  tip: t('tipStopping'), bg: undefined,                                               cmd: ''                        },
-  };
-  const m = map[state] || map.stopped;
-  sbTomcat.text            = m.text;
-  sbTomcat.tooltip         = m.tip;
-  sbTomcat.backgroundColor = m.bg;
-  sbTomcat.command         = m.cmd || undefined;
+// 모든 인스턴스 상태 요약 (running/total). 클릭 → pickInstance QuickPick.
+function refreshTomcatBar() {
+  if (!sbTomcat) return;
+  const all = [...instances.values()];
+  const running = all.filter(i => i.running || i.orphanPid).length;
+  const starting = anyStarting();
+  const icon = starting ? '$(sync~spin)' : '$(server)';
+  sbTomcat.text = `${icon} Tomcat ${running}/${all.length}`;
+  sbTomcat.tooltip = all.length
+    ? all.map(i => {
+        const st = i.orphanPid ? 'orphan' : i.starting ? 'starting' : i.running ? 'running' : 'stopped';
+        return `${i.name}: ${st} (:${i.port})`;
+      }).join('\n')
+    : 'Tomcat';
+  sbTomcat.backgroundColor = running > 0
+    ? new vscode.ThemeColor('statusBarItem.warningBackground') : undefined;
+  sbTomcat.command = 'tomcatAutoDeploy.pickInstance';
   sbTomcat.show();
 
-  vscode.commands.executeCommand('setContext', 'tomcatAutoDeploy.running', state === 'running');
-  vscode.commands.executeCommand('setContext', 'tomcatAutoDeploy.starting', state === 'starting');
+  vscode.commands.executeCommand('setContext', 'tomcatAutoDeploy.running', running > 0);
+  vscode.commands.executeCommand('setContext', 'tomcatAutoDeploy.starting', starting);
   if (tomcatTreeProvider) tomcatTreeProvider.refresh();
 }
 
@@ -487,20 +716,20 @@ function refreshDeployBar(state, filename) {
 // ══════════════════════════════════════════════════════════
 //  PID 파일 관리
 // ══════════════════════════════════════════════════════════
-function getPidFile() {
-  return path.join(getConfig().catalinaBase, 'tomcat.pid');
+function getPidFile(inst) {
+  return path.join(inst.catalinaBase, 'tomcat.pid');
 }
 
-function savePid(pid) {
-  try { fs.writeFileSync(getPidFile(), String(pid), 'utf-8'); } catch {}
+function savePid(inst, pid) {
+  try { fs.writeFileSync(getPidFile(inst), String(pid), 'utf-8'); } catch {}
 }
 
-function readPid() {
-  try { return parseInt(fs.readFileSync(getPidFile(), 'utf-8').trim(), 10) || null; } catch { return null; }
+function readPid(inst) {
+  try { return parseInt(fs.readFileSync(getPidFile(inst), 'utf-8').trim(), 10) || null; } catch { return null; }
 }
 
-function removePidFile() {
-  try { fs.unlinkSync(getPidFile()); } catch {}
+function removePidFile(inst) {
+  try { fs.unlinkSync(getPidFile(inst)); } catch {}
 }
 
 function isProcessAlive(pid) {
@@ -586,48 +815,43 @@ function findProcessByCatalinaBase(catalinaBase) {
 // ══════════════════════════════════════════════════════════
 //  고아 프로세스 감지
 // ══════════════════════════════════════════════════════════
-function detectOrphanProcess() {
-  const pid = readPid();
+function detectOrphanProcess(inst) {
+  const pid = readPid(inst);
   if (pid && isProcessAlive(pid)) {
-    orphanPid = pid;
-    tomcatRunning = true;
+    inst.orphanPid = pid;
+    inst.running = true;
     log(t('logOrphanDetected', pid), 'WARN');
-    refreshTomcatBar('running');
+    logTo(inst, t('logOrphanDetected', pid), 'WARN');
     return true;
   }
-  if (pid) removePidFile();
+  if (pid) removePidFile(inst);
   return false;
 }
 
 // ══════════════════════════════════════════════════════════
 //  .vscode/tomcat 디렉토리 초기화
 // ══════════════════════════════════════════════════════════
-function initTomcatBase() {
-  const cfg  = getConfig();
+function initTomcatBase(inst) {
+  const cfg  = inst;
   const base = cfg.catalinaBase;
+  const isPrimary   = inst.name === getDefaultInstanceName();
+  const defaultInst = isPrimary ? null : getDefaultInstance();
 
   for (const d of ['conf', 'webapps', 'logs', 'work', 'temp']) {
     fs.mkdirSync(path.join(base, d), { recursive: true });
   }
 
-  // 이전 버전 war → apps/{contextPath} 마이그레이션
-  const oldWarDir = path.join(base, 'war');
-  if (fs.existsSync(oldWarDir)) {
-    fs.cpSync(oldWarDir, cfg.warDir, { recursive: true });
-    fs.rmSync(oldWarDir, { recursive: true, force: true });
-    log(`[Init] war → apps/${path.basename(cfg.warDir)} 마이그레이션 완료`);
-  }
-
+  // 배포 디렉토리(docBase)는 모든 인스턴스 공유 → cfg.warDir = .vscode/tomcat/webapp/<contextPath>
   fs.mkdirSync(path.join(cfg.warDir, 'WEB-INF', 'classes'), { recursive: true });
 
-  // apps/ 하위에서 현재 contextPath 디렉토리가 아닌 것 삭제
-  const appsDir = path.join(base, 'apps');
-  const activeTopDir = path.relative(appsDir, cfg.warDir).split(path.sep)[0];
+  // 공유 webapp/ 하위에서 현재 contextPath 가 아닌 옛 디렉토리 정리
+  const appsDir = path.dirname(cfg.warDir);
+  const activeTopDir = path.basename(cfg.warDir);
   try {
     for (const entry of fs.readdirSync(appsDir, { withFileTypes: true })) {
       if (entry.isDirectory() && entry.name !== activeTopDir) {
         fs.rmSync(path.join(appsDir, entry.name), { recursive: true, force: true });
-        log(`[Init] 이전 앱 디렉토리 삭제: apps/${entry.name}`);
+        log(`[Init] 이전 앱 디렉토리 삭제: webapp/${entry.name}`);
       }
     }
   } catch {}
@@ -645,21 +869,33 @@ function initTomcatBase() {
     } catch {}
   }
   if (needWriteContextXml) {
-    fs.writeFileSync(contextXml,
+    const primaryCtxXml = defaultInst ? path.join(defaultInst.confDir, 'context.xml') : null;
+    if (primaryCtxXml && fs.existsSync(primaryCtxXml)) {
+      fs.copyFileSync(primaryCtxXml, contextXml);
+      log(`[Init] context.xml — "${defaultInst.name}"에서 복사`);
+    } else {
+      fs.writeFileSync(contextXml,
 `<?xml version="1.0" encoding="UTF-8"?>
 <Context reloadable="false">
   <Valve className="org.apache.catalina.valves.RemoteAddrValve"
          allow="127\\.\\d+\\.\\d+\\.\\d+|::1|0:0:0:0:0:0:0:1"/>
 </Context>
 `, 'utf-8');
-    log(t('logCtxCreated'));
+      log(t('logCtxCreated'));
+    }
   }
 
   // ── server.xml ──
   const serverXml = path.join(cfg.confDir, 'server.xml');
   if (!fs.existsSync(serverXml)) {
-    const ctxPath = cfg.contextPath === '/' ? '' : cfg.contextPath;
-    fs.writeFileSync(serverXml,
+    const primarySrvXml = defaultInst ? path.join(defaultInst.confDir, 'server.xml') : null;
+    if (primarySrvXml && fs.existsSync(primarySrvXml)) {
+      // 기본 인스턴스의 server.xml을 복사 — 아래 업데이트 블록에서 포트/docBase 교체
+      fs.copyFileSync(primarySrvXml, serverXml);
+      log(`[Init] server.xml — "${defaultInst.name}"에서 복사`);
+    } else {
+      const ctxPath = cfg.contextPath === '/' ? '' : cfg.contextPath;
+      fs.writeFileSync(serverXml,
 `<?xml version="1.0" encoding="UTF-8"?>
 <Server port="-1" shutdown="SHUTDOWN">
   <Listener className="org.apache.catalina.startup.VersionLoggerListener"/>
@@ -699,29 +935,23 @@ function initTomcatBase() {
   </Service>
 </Server>
 `, 'utf-8');
-    log(t('logSrvCreated'));
-  } else {
+      log(t('logSrvCreated'));
+    }
+  }
+  // 포트/docBase는 항상 최신화 (신규 생성·기본 복사·기존 파일 모두)
+  {
     let xml = fs.readFileSync(serverXml, 'utf-8');
     let changed = false;
     const ctxPath = cfg.contextPath === '/' ? '' : cfg.contextPath;
 
-    const newXml1 = xml.replace(
-      /(<Connector\b[^>]*\bport=")(\d+)(")/,
-      (m, pre, oldPort, post) => {
-        if (oldPort !== String(cfg.port)) { changed = true; }
-        return `${pre}${cfg.port}${post}`;
-      }
-    );
-    xml = newXml1;
-
-    const newXml2 = xml.replace(
-      /(<Connector\b[^>]*\bredirectPort=")(\d+)(")/,
-      (m, pre, oldPort, post) => {
-        if (oldPort !== String(cfg.redirectPort)) { changed = true; }
-        return `${pre}${cfg.redirectPort}${post}`;
-      }
-    );
-    xml = newXml2;
+    xml = xml.replace(/(<Connector\b[^>]*\bport=")(\d+)(")/, (m, pre, oldPort, post) => {
+      if (oldPort !== String(cfg.port)) changed = true;
+      return `${pre}${cfg.port}${post}`;
+    });
+    xml = xml.replace(/(<Connector\b[^>]*\bredirectPort=")(\d+)(")/, (m, pre, old, post) => {
+      if (old !== String(cfg.redirectPort)) changed = true;
+      return `${pre}${cfg.redirectPort}${post}`;
+    });
 
     if (!xml.includes('<Context')) {
       xml = xml.replace(
@@ -730,23 +960,14 @@ function initTomcatBase() {
       );
       changed = true;
     } else {
-      const newXml3 = xml.replace(
-        /(<Context\b[^>]*\bpath=")([^"]*)(")/,
-        (m, pre, oldPath, post) => {
-          if (oldPath !== ctxPath) { changed = true; }
-          return `${pre}${ctxPath}${post}`;
-        }
-      );
-      xml = newXml3;
-
-      const newXml4 = xml.replace(
-        /(<Context\b[^>]*\bdocBase=")([^"]*)(")/,
-        (m, pre, oldBase, post) => {
-          if (oldBase !== cfg.warDir) { changed = true; }
-          return `${pre}${cfg.warDir}${post}`;
-        }
-      );
-      xml = newXml4;
+      xml = xml.replace(/(<Context\b[^>]*\bpath=")([^"]*)(")/,  (m, pre, old, post) => {
+        if (old !== ctxPath) changed = true;
+        return `${pre}${ctxPath}${post}`;
+      });
+      xml = xml.replace(/(<Context\b[^>]*\bdocBase=")([^"]*)(")/,  (m, pre, old, post) => {
+        if (old !== cfg.warDir) changed = true;
+        return `${pre}${cfg.warDir}${post}`;
+      });
     }
 
     if (changed) {
@@ -777,29 +998,26 @@ function initTomcatBase() {
 // ══════════════════════════════════════════════════════════
 //  Tomcat 시작
 // ══════════════════════════════════════════════════════════
-async function startTomcat() {
-  if (tomcatRunning || orphanPid) {
-    vscode.window.showWarningMessage(t('alreadyRunning'));
+async function startTomcat(inst) {
+  if (!inst) return;
+  if (inst.running || inst.orphanPid || inst.starting) {
+    vscode.window.showWarningMessage(`${inst.name}: ${t('alreadyRunning')}`);
     return;
   }
-  if (tomcatStarting) {
-    vscode.window.showWarningMessage(t('alreadyRunning'));
-    return;
-  }
-  tomcatStarting = true;
-  refreshTomcatBar('starting');
+  inst.starting = true;
+  refreshTomcatBar();
 
-  // 시작 시 기존 출력 패널 로그 비우기
-  outputChannel.clear();
-  localhostLogChannel.clear();
+  // 시작 시 이 인스턴스 로그 패널만 비움 (공통 채널/다른 인스턴스 로그는 보존)
+  getLogChannel(inst).clear();
+  getLocalhostChannel(inst).clear();
 
   try {
-    const cfg = getConfig();
+    const cfg = inst;
 
     const existingPid = findProcessByCatalinaBase(cfg.catalinaBase);
     if (existingPid) {
       const sel = await vscode.window.showWarningMessage(
-        t('existingProcess', existingPid),
+        `${inst.name}: ${t('existingProcess', existingPid)}`,
         t('forceKillAndStart'), t('cancel')
       );
       if (sel === t('forceKillAndStart')) {
@@ -807,46 +1025,48 @@ async function startTomcat() {
         log(t('logExistingKill', existingPid));
         await new Promise(r => setTimeout(r, 2000));
       } else {
-        refreshTomcatBar('stopped');
+        inst.starting = false;
+        refreshTomcatBar();
         return;
       }
     }
 
     if (!cfg.catalinaHome) {
       const ans = await vscode.window.showErrorMessage(
-        t('catalinaRequired'),
+        `${inst.name}: ${t('catalinaRequired')}`,
         t('openSettings')
       );
       if (ans) vscode.commands.executeCommand('workbench.action.openSettings', 'tomcatAutoDeploy.catalinaHome');
-      refreshTomcatBar('stopped');
+      inst.starting = false;
+      refreshTomcatBar();
       return;
     }
 
     if (await isPortInUse(cfg.port)) {
       const killed = await showPortConflict(cfg.port, 'httpPortInUse');
-      if (!killed || await isPortInUse(cfg.port)) { refreshTomcatBar('stopped'); return; }
+      if (!killed || await isPortInUse(cfg.port)) { inst.starting = false; refreshTomcatBar(); return; }
     }
 
     if (await isPortInUse(cfg.debugPort)) {
       const killed = await showPortConflict(cfg.debugPort, 'debugPortInUse');
-      if (!killed || await isPortInUse(cfg.debugPort)) { refreshTomcatBar('stopped'); return; }
+      if (!killed || await isPortInUse(cfg.debugPort)) { inst.starting = false; refreshTomcatBar(); return; }
     }
 
-    initTomcatBase();
+    initTomcatBase(inst);
 
-    const compileOk = await syncAll();
+    const compileOk = await syncAll(inst);
     if (compileOk === false && detectBuildTool(getWorkspaceRoot())) {
       log(t('logAutoFullBuild'));
       await buildAndDeploy();
     }
 
     // 동기화 중 stop을 눌러 starting이 해제됐다면 spawn하지 않고 종료
-    if (!tomcatStarting) {
-      refreshTomcatBar('stopped');
+    if (!inst.starting) {
+      refreshTomcatBar();
       return;
     }
 
-    outputChannel.show(true);
+    getLogChannel(inst).show(true);
 
     const isWin    = process.platform === 'win32';
     const catalina = path.join(cfg.catalinaHome, 'bin', isWin ? 'catalina.bat' : 'catalina.sh');
@@ -863,71 +1083,72 @@ async function startTomcat() {
       CATALINA_OPTS:  prevOpts,
     };
 
-    log(t('logJpdaStart', cfg.debugPort));
+    log(`[${inst.name}] ${t('logJpdaStart', cfg.debugPort)}`);
 
-    tomcatLineRaw = false;
-    tomcatProcess = spawn(catalina, ['jpda', 'run'], { env, shell: true, detached: !isWin });
-    if (tomcatProcess.pid) savePid(tomcatProcess.pid);
-    tomcatProcess.stdout.on('data', d => logTomcatChunk(d, 'INFO'));
-    tomcatProcess.stderr.on('data', d => logTomcatChunk(d, 'WARN'));
-    tomcatProcess.on('exit', code => {
-      tomcatRunning = false;
-      tomcatProcess = null;
-      orphanPid = null;
-      removePidFile();
-      stopLocalhostLogWatch();
-      refreshTomcatBar('stopped');
-      log(t('logExit', code));
+    inst.lineRaw = false;
+    inst.proc = spawn(catalina, ['jpda', 'run'], { env, shell: true, detached: !isWin });
+    if (inst.proc.pid) savePid(inst, inst.proc.pid);
+    inst.proc.stdout.on('data', d => logTomcatChunk(inst, d, 'INFO'));
+    inst.proc.stderr.on('data', d => logTomcatChunk(inst, d, 'WARN'));
+    inst.proc.on('exit', code => {
+      inst.running = false;
+      inst.proc = null;
+      inst.orphanPid = null;
+      removePidFile(inst);
+      stopLocalhostLogWatch(inst);
+      refreshTomcatBar();
+      logTo(inst, t('logExit', code));
     });
 
     try {
-      await waitForTomcat(cfg.port, 30000);
-      tomcatRunning = true;
-      refreshTomcatBar('running');
-      startLocalhostLogWatch();
+      await waitForTomcat(inst, 30000);
+      inst.running = true;
+      inst.starting = false;
+      refreshTomcatBar();
+      startLocalhostLogWatch(inst);
       vscode.window.showInformationMessage(
-        t('tomcatStarted', cfg.port, cfg.contextPath),
+        `${inst.name}: ${t('tomcatStarted', cfg.port, cfg.contextPath)}`,
         t('openBrowser')
       ).then(sel => {
         if (sel) vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${cfg.port}${cfg.contextPath}`));
       });
-      log(t('logStarted', cfg.port, cfg.contextPath));
+      logTo(inst, t('logStarted', cfg.port, cfg.contextPath));
     } catch (err) {
       // 중지 요청에 의한 취소 — stop/forceStop이 프로세스를 정리하므로 조용히 종료
       if (err && err.message === '__cancelled__') return;
-      tomcatRunning = false;
-      tomcatProcess?.kill();
-      tomcatProcess = null;
-      refreshTomcatBar('stopped');
-      log(t('logStartFailed', err.message), 'ERROR');
-      vscode.window.showErrorMessage(t('startupFailed', err.message));
-      outputChannel.show(true);
+      inst.running = false;
+      inst.proc?.kill();
+      inst.proc = null;
+      refreshTomcatBar();
+      logTo(inst, t('logStartFailed', err.message), 'ERROR');
+      vscode.window.showErrorMessage(`${inst.name}: ${t('startupFailed', err.message)}`);
+      getLogChannel(inst).show(true);
     }
   } catch (err) {
-    tomcatRunning = false;
-    tomcatProcess?.kill();
-    tomcatProcess = null;
-    refreshTomcatBar('stopped');
-    log(t('logStartFailed', err && err.message || String(err)), 'ERROR');
-    vscode.window.showErrorMessage(t('startupFailed', err && err.message || String(err)));
-    outputChannel.show(true);
+    inst.running = false;
+    inst.proc?.kill();
+    inst.proc = null;
+    refreshTomcatBar();
+    logTo(inst, t('logStartFailed', err && err.message || String(err)), 'ERROR');
+    vscode.window.showErrorMessage(`${inst.name}: ${t('startupFailed', err && err.message || String(err))}`);
+    getLogChannel(inst).show(true);
   } finally {
-    tomcatStarting = false;
+    inst.starting = false;
+    refreshTomcatBar();
   }
 }
 
-// Tomcat HTTP 응답 폴링
-function waitForTomcat(port, timeoutMs) {
+// Tomcat HTTP 응답 폴링 (기동 대기 중 stop 시 inst.starting/proc 기반으로 즉시 취소)
+function waitForTomcat(inst, timeoutMs) {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + timeoutMs;
     const check = () => {
-      // 기동 대기 중 사용자가 중지를 누른 경우 즉시 취소
-      if (!tomcatStarting || !tomcatProcess) {
+      if (!inst.starting || !inst.proc) {
         reject(new Error('__cancelled__'));
         return;
       }
       const req = http.request(
-        { hostname: 'localhost', port, path: '/', method: 'HEAD', timeout: 1000 },
+        { hostname: 'localhost', port: inst.port, path: '/', method: 'HEAD', timeout: 1000 },
         () => resolve()
       );
       req.on('error', () => {
@@ -943,36 +1164,37 @@ function waitForTomcat(port, timeoutMs) {
 // ══════════════════════════════════════════════════════════
 //  Tomcat 중지
 // ══════════════════════════════════════════════════════════
-async function stopTomcat() {
-  if (!tomcatRunning && !orphanPid && !tomcatProcess) {
-    if (tomcatStarting) {
-      // 기동 도중(예: syncAll 진행 중) 사용자가 중지를 누른 경우 — startTomcat이 spawn 직전에 빠져나가도록 신호만 보낸다
-      tomcatStarting = false;
-      refreshTomcatBar('stopped');
-      log(t('logStopReq'));
+async function stopTomcat(inst) {
+  if (!inst) return;
+  if (!inst.running && !inst.orphanPid && !inst.proc) {
+    if (inst.starting) {
+      // 기동 도중(예: syncAll 진행 중) 사용자가 중지를 누른 경우 — spawn 직전에 빠져나가도록 신호만 보낸다
+      inst.starting = false;
+      refreshTomcatBar();
+      logTo(inst, t('logStopReq'));
       return;
     }
-    vscode.window.showWarningMessage(t('notRunning'));
+    vscode.window.showWarningMessage(`${inst.name}: ${t('notRunning')}`);
     return;
   }
-  tomcatStarting = false;  // 기동 대기 중이면 waitForTomcat을 취소시킨다
-  refreshTomcatBar('stopping');
-  log(t('logStopReq'));
+  inst.starting = false;  // 기동 대기 중이면 waitForTomcat을 취소시킨다
+  refreshTomcatBar();
+  logTo(inst, t('logStopReq'));
 
-  if (orphanPid) {
-    log(t('logOrphanKill', orphanPid), 'WARN');
-    forceKillPid(orphanPid);
-    orphanPid = null;
-    tomcatRunning = false;
-    removePidFile();
-    refreshTomcatBar('stopped');
-    log(t('logKillDone'));
-    vscode.window.showInformationMessage(t('orphanKilled'));
+  if (inst.orphanPid) {
+    logTo(inst, t('logOrphanKill', inst.orphanPid), 'WARN');
+    forceKillPid(inst.orphanPid);
+    inst.orphanPid = null;
+    inst.running = false;
+    removePidFile(inst);
+    refreshTomcatBar();
+    logTo(inst, t('logKillDone'));
+    vscode.window.showInformationMessage(`${inst.name}: ${t('orphanKilled')}`);
     return;
   }
 
-  if (tomcatProcess) {
-    const proc = tomcatProcess;
+  if (inst.proc) {
+    const proc = inst.proc;
     const pid  = proc.pid;
 
     const waitExit = new Promise(resolve => {
@@ -982,28 +1204,29 @@ async function stopTomcat() {
 
     const isWin = process.platform === 'win32';
     if (isWin && pid) {
-      log(`[Tomcat] taskkill /F /T /PID ${pid}`);
+      logTo(inst, `taskkill /F /T /PID ${pid}`);
       try {
         require('child_process').execSync(`taskkill /F /T /PID ${pid}`, { stdio: 'ignore', shell: true });
       } catch {}
     } else if (pid) {
       proc.kill('SIGTERM');
-      log(t('logSigterm'));
+      logTo(inst, t('logSigterm'));
       setTimeout(() => {
-        if (tomcatProcess) {
+        if (inst.proc) {
           try { process.kill(-pid, 'SIGKILL'); } catch {}
           try { process.kill(pid, 'SIGKILL'); } catch {}
-          log(t('logSigkill'), 'WARN');
+          logTo(inst, t('logSigkill'), 'WARN');
         }
       }, 3000);
     }
 
     await waitExit;
-    tomcatRunning = false;
-    tomcatProcess = null;
-    removePidFile();
-    refreshTomcatBar('stopped');
-    log(t('logStopDone'));
+    inst.running = false;
+    inst.proc = null;
+    removePidFile(inst);
+    stopLocalhostLogWatch(inst);
+    refreshTomcatBar();
+    logTo(inst, t('logStopDone'));
   }
 }
 
@@ -1011,12 +1234,12 @@ async function stopTomcat() {
 // ══════════════════════════════════════════════════════════
 //  localhost.yyyy-MM-dd.log 실시간 감시
 // ══════════════════════════════════════════════════════════
-function startLocalhostLogWatch() {
-  stopLocalhostLogWatch();
+function startLocalhostLogWatch(inst) {
+  stopLocalhostLogWatch(inst);
 
-  const cfg = getConfig();
-  const logsDir = path.join(cfg.catalinaBase, 'logs');
-  localhostLogOffset = 0;
+  const logsDir = path.join(inst.catalinaBase, 'logs');
+  const channel = getLocalhostChannel(inst);
+  inst.logOffset = 0;
 
   function getLogPath() {
     const d = new Date();
@@ -1030,24 +1253,24 @@ function startLocalhostLogWatch() {
     const logPath = getLogPath();
     if (!fs.existsSync(logPath)) return;
     const stat = fs.statSync(logPath);
-    if (stat.size <= localhostLogOffset) return;
+    if (stat.size <= inst.logOffset) return;
 
     const stream = fs.createReadStream(logPath, {
-      start: localhostLogOffset,
+      start: inst.logOffset,
       encoding: 'utf-8',
     });
     let buf = '';
     stream.on('data', chunk => { buf += chunk; });
     stream.on('end', () => {
-      localhostLogOffset = stat.size;
+      inst.logOffset = stat.size;
       for (const line of buf.split(/\r?\n/)) {
-        if (line.trim()) localhostLogChannel.appendLine(line);
+        if (line.trim()) channel.appendLine(line);
       }
     });
   }
 
   fs.mkdirSync(logsDir, { recursive: true });
-  localhostLogWatcher = fs.watch(logsDir, (eventType, filename) => {
+  inst.logWatcher = fs.watch(logsDir, (eventType, filename) => {
     if (filename && filename.startsWith('localhost.') && filename.endsWith('.log')) {
       const currentLog = path.basename(getLogPath());
       if (filename !== currentLog) return;
@@ -1056,55 +1279,57 @@ function startLocalhostLogWatch() {
   });
 
   tailLog();
-  log(t('logLogWatch'));
+  logTo(inst, t('logLogWatch'));
 }
 
-function stopLocalhostLogWatch() {
-  if (localhostLogWatcher) {
-    localhostLogWatcher.close();
-    localhostLogWatcher = null;
+function stopLocalhostLogWatch(inst) {
+  if (inst.logWatcher) {
+    try { inst.logWatcher.close(); } catch {}
+    inst.logWatcher = null;
   }
-  localhostLogOffset = 0;
+  inst.logOffset = 0;
 }
 
 // ══════════════════════════════════════════════════════════
 //  Tomcat 강제 중지 (즉시 SIGKILL / taskkill /F)
 // ══════════════════════════════════════════════════════════
-async function forceStopTomcat() {
-  if (!tomcatRunning && !orphanPid && !tomcatProcess) {
-    if (tomcatStarting) {
-      tomcatStarting = false;
-      refreshTomcatBar('stopped');
-      log(t('logForceStopReq'));
+async function forceStopTomcat(inst) {
+  if (!inst) return;
+  if (!inst.running && !inst.orphanPid && !inst.proc) {
+    if (inst.starting) {
+      inst.starting = false;
+      refreshTomcatBar();
+      logTo(inst, t('logForceStopReq'));
       return;
     }
-    vscode.window.showWarningMessage(t('notRunning'));
+    vscode.window.showWarningMessage(`${inst.name}: ${t('notRunning')}`);
     return;
   }
-  tomcatStarting = false;  // 기동 대기 중이면 waitForTomcat을 취소시킨다
-  refreshTomcatBar('stopping');
-  log(t('logForceStopReq'));
+  inst.starting = false;  // 기동 대기 중이면 waitForTomcat을 취소시킨다
+  refreshTomcatBar();
+  logTo(inst, t('logForceStopReq'));
 
-  const pid = orphanPid || (tomcatProcess && tomcatProcess.pid);
+  const pid = inst.orphanPid || (inst.proc && inst.proc.pid);
   if (pid) {
     forceKillPid(pid);
-    log(t('logForceStop', pid));
+    logTo(inst, t('logForceStop', pid));
   }
 
-  if (tomcatProcess) {
+  if (inst.proc) {
     await new Promise(resolve => {
-      tomcatProcess.once('exit', resolve);
+      inst.proc.once('exit', resolve);
       setTimeout(resolve, 5000);
     });
   }
 
-  tomcatRunning = false;
-  tomcatProcess = null;
-  orphanPid = null;
-  removePidFile();
-  refreshTomcatBar('stopped');
-  log(t('logForceStopDone'));
-  vscode.window.showInformationMessage(t('forceStopDone'));
+  inst.running = false;
+  inst.proc = null;
+  inst.orphanPid = null;
+  removePidFile(inst);
+  stopLocalhostLogWatch(inst);
+  refreshTomcatBar();
+  logTo(inst, t('logForceStopDone'));
+  vscode.window.showInformationMessage(`${inst.name}: ${t('forceStopDone')}`);
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1684,22 +1909,23 @@ async function compileAndDeploy(savedFilePath) {
   const ws = getWorkspaceRoot();
   if (!ws) return;
 
-  const cfg        = getConfig();
-  const classesDir = path.join(cfg.warDir, 'WEB-INF', 'classes');
-  const srcRoot    = path.join(ws, cfg.javaSourceRoot);
-  const javaBin    = cfg.javaHome ? path.join(cfg.javaHome, 'bin', 'javac') : 'javac';
+  const common     = getCommonConfig();
+  const compileCfg = getCompileConfig(common);
+  const buildClassesDir = getBuildClassesDir();
+  const srcRoot    = path.join(ws, common.javaSourceRoot);
+  const javaBin    = compileCfg.javaHome ? path.join(compileCfg.javaHome, 'bin', 'javac') : 'javac';
   const fname      = path.basename(savedFilePath);
 
-  fs.mkdirSync(classesDir, { recursive: true });
+  fs.mkdirSync(buildClassesDir, { recursive: true });
 
   const cpSep = process.platform === 'win32' ? ';' : ':';
-  const cpParts = [classesDir];
-  if (cfg.catalinaHome) {
-    cpParts.push(path.join(cfg.catalinaHome, 'lib', '*'));
+  const cpParts = [buildClassesDir];
+  if (compileCfg.catalinaHome) {
+    cpParts.push(path.join(compileCfg.catalinaHome, 'lib', '*'));
   }
   const depCp = await resolveDependencyClasspath();
   if (depCp) cpParts.push(depCp);
-  cpParts.push(...cfg.classpath);
+  cpParts.push(...compileCfg.classpath);
   const cp    = cpParts.join(cpSep);
 
   const javaVer = detectJavaVersion(ws);
@@ -1721,9 +1947,10 @@ async function compileAndDeploy(savedFilePath) {
       }
     }
   }
-  argLines.push('-cp', cp, '-sourcepath', sourcePaths.join(cpSep), '-d', classesDir, savedFilePath);
+  argLines.push('-cp', cp, '-sourcepath', sourcePaths.join(cpSep), '-d', buildClassesDir, savedFilePath);
 
-  const argFile = path.join(ws, '.vscode', 'tomcat', 'javac-args.txt');
+  const argFile = path.join(getTomcatRoot(), '.build', 'javac-args-save.txt');
+  fs.mkdirSync(path.dirname(argFile), { recursive: true });
   fs.writeFileSync(argFile, argLines.map(a => `"${a.replace(/\\/g, '/')}"`).join('\n'), 'utf-8');
 
   const cmd = `"${javaBin}" @"${argFile}"`;
@@ -1734,39 +1961,43 @@ async function compileAndDeploy(savedFilePath) {
   try {
     const { stderr } = await execAsync(cmd);
     if (stderr) log(t('logStderr', stderr), 'WARN');
+
+    const relPath   = path.relative(srcRoot, savedFilePath);
+    const className = relPath.replace(/\.java$/, '').replace(/[/\\]/g, '.');
+    const relClass  = relPath.replace(/\.java$/, '.class');
+    const buildClassFile = path.join(buildClassesDir, relClass);
+
+    if (!fs.existsSync(buildClassFile)) { refreshDeployBar('ok', fname); return; }
+
+    // 메인 + inner($) .class 버퍼 수집 (rel 경로 유지)
+    const baseName = path.basename(savedFilePath, '.java');
+    const classDir = path.dirname(buildClassFile);
+    const relDir   = path.dirname(relClass);
+    const swap = [{ className, rel: relClass, bytes: fs.readFileSync(buildClassFile) }];
+    for (const f of fs.readdirSync(classDir)) {
+      if (f.startsWith(baseName + '$') && f.endsWith('.class')) {
+        const innerName = className + '$' + f.slice(baseName.length + 1, -6);
+        swap.push({ className: innerName, rel: path.join(relDir, f), bytes: fs.readFileSync(path.join(classDir, f)) });
+      }
+    }
     refreshDeployBar('ok', fname);
 
-    if (tomcatRunning) {
-      const relPath   = path.relative(srcRoot, savedFilePath);
-      const className = relPath.replace(/\.java$/, '').replace(/[/\\]/g, '.');
-      const classFile = path.join(classesDir, relPath.replace(/\.java$/, '.class'));
-
-      if (fs.existsSync(classFile)) {
-        try {
-          // 메인 클래스 + inner class ($1, $2, ...) 모두 수집
-          const baseName = path.basename(savedFilePath, '.java');
-          const classDir = path.dirname(classFile);
-          const swapClasses = [{ className, classBytes: fs.readFileSync(classFile) }];
-          const allClassFiles = fs.readdirSync(classDir);
-          log(`[HotSwap] classDir: ${classDir}, baseName: ${baseName}`);
-          log(`[HotSwap] classDir 내 파일: ${allClassFiles.filter(f => f.startsWith(baseName)).join(', ')}`);
-          for (const f of allClassFiles) {
-            if (f.startsWith(baseName + '$') && f.endsWith('.class')) {
-              const innerName = className + '$' + f.slice(baseName.length + 1, -6);
-              log(`[HotSwap] inner class 발견: ${f} → ${innerName}`);
-              swapClasses.push({ className: innerName, classBytes: fs.readFileSync(path.join(classDir, f)) });
-            }
-          }
-          log(`[HotSwap] 교체 대상 클래스 ${swapClasses.length}개: ${swapClasses.map(c => c.className).join(', ')}`);
-          const result = await jdwpHotSwap(cfg.debugPort, swapClasses);
-          if (result === 'ok') {
-            log(t('logHotSwapOk', savedFilePath));
-          } else {
-            log(t('logHotSwapSkip', className));
-          }
-        } catch (err) {
-          log(t('logHotSwapFail', className, err.message), 'WARN');
-        }
+    // 각 실행 중 인스턴스로 복사 + HotSwap (같은 버퍼 재사용)
+    const swapClasses = swap.map(c => ({ className: c.className, classBytes: c.bytes }));
+    for (const inst of runningInstances()) {
+      const instClassesDir = path.join(inst.warDir, 'WEB-INF', 'classes');
+      for (const c of swap) {
+        const dest = path.join(instClassesDir, c.rel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.writeFileSync(dest, c.bytes);
+      }
+      if (inst.orphanPid || !inst.running) continue; // orphan은 디버그 연결 불명 → 디스크 반영만
+      try {
+        const result = await jdwpHotSwap(inst.debugPort, swapClasses);
+        if (result === 'ok') logTo(inst, t('logHotSwapOk', savedFilePath));
+        else                 logTo(inst, t('logHotSwapSkip', className));
+      } catch (err) {
+        logTo(inst, t('logHotSwapFail', className, err.message), 'WARN');
       }
     }
   } catch (err) {
@@ -1785,21 +2016,22 @@ async function deployStatic(savedFilePath) {
   const ws = getWorkspaceRoot();
   if (!ws) return;
 
-  const cfg        = getConfig();
-  const webSrcRoot = path.join(ws, cfg.webContentRoot);
+  const common     = getCommonConfig();
+  const webSrcRoot = path.join(ws, common.webContentRoot);
   const rel        = path.relative(webSrcRoot, savedFilePath);
 
   if (rel.startsWith('..')) return;
 
-  const dest  = path.join(cfg.warDir, rel);
   const fname = path.basename(savedFilePath);
-
-  fs.mkdirSync(path.dirname(dest), { recursive: true });
   refreshDeployBar('deploying', fname);
 
   try {
-    fs.copyFileSync(savedFilePath, dest);
-    log(`[Static] ${rel} → ${dest}`);
+    for (const inst of runningInstances()) {
+      const dest = path.join(inst.warDir, rel);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(savedFilePath, dest);
+      logTo(inst, `[Static] ${rel.replace(/\\/g, '/')} → ${dest}`);
+    }
     refreshDeployBar('ok', fname);
   } catch (e) {
     log(`[Static] deploy failed: ${e.message}`, 'ERROR');
@@ -1811,21 +2043,22 @@ async function deployResource(savedFilePath) {
   const ws = getWorkspaceRoot();
   if (!ws) return;
 
-  const cfg        = getConfig();
-  const resSrcRoot = path.join(ws, cfg.resourceRoot);
+  const common     = getCommonConfig();
+  const resSrcRoot = path.join(ws, common.resourceRoot);
   const rel        = path.relative(resSrcRoot, savedFilePath);
 
   if (rel.startsWith('..')) return;
 
-  const dest  = path.join(cfg.warDir, 'WEB-INF', 'classes', rel);
   const fname = path.basename(savedFilePath);
-
-  fs.mkdirSync(path.dirname(dest), { recursive: true });
   refreshDeployBar('deploying', fname);
 
   try {
-    fs.copyFileSync(savedFilePath, dest);
-    log(`[Resource] ${rel} → WEB-INF/classes/${rel}`);
+    for (const inst of runningInstances()) {
+      const dest = path.join(inst.warDir, 'WEB-INF', 'classes', rel);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(savedFilePath, dest);
+      logTo(inst, `[Resource] ${rel.replace(/\\/g, '/')} → WEB-INF/classes/`);
+    }
     refreshDeployBar('ok', fname);
   } catch (e) {
     log(`[Resource] deploy failed: ${e.message}`, 'ERROR');
@@ -2045,7 +2278,7 @@ async function compileAllJava(ws, cfg, classesDir, depClasspath) {
   argLines.push('-cp', cp, '-sourcepath', sourcePaths, '-d', classesDir);
   javaFiles.forEach(f => argLines.push(f));
 
-  const argFile = path.join(ws, '.vscode', 'tomcat', 'javac-args.txt');
+  const argFile = path.join(getTomcatRoot(), '.build', 'javac-args.txt');
   fs.mkdirSync(path.dirname(argFile), { recursive: true });
   fs.writeFileSync(argFile, argLines.map(a => `"${a.replace(/\\/g, '/')}"`).join('\n'), 'utf-8');
 
@@ -2065,31 +2298,35 @@ async function compileAllJava(ws, cfg, classesDir, depClasspath) {
   }
 }
 
-async function syncAll() {
+async function syncAll(inst) {
   const ws = getWorkspaceRoot();
-  if (!ws) return;
+  if (!ws || !inst) return;
 
-  const cfg        = getConfig();
-  const srcRoot    = path.join(ws, cfg.javaSourceRoot);
-  const webSrcRoot = path.join(ws, cfg.webContentRoot);
-  const resSrcRoot = path.join(ws, cfg.resourceRoot);
-  const classesDir = path.join(cfg.warDir, 'WEB-INF', 'classes');
+  const common     = getCommonConfig();
+  const compileCfg = getCompileConfig(common);
+  const srcRoot    = path.join(ws, common.javaSourceRoot);
+  const webSrcRoot = path.join(ws, common.webContentRoot);
+  const resSrcRoot = path.join(ws, common.resourceRoot);
+  const buildClassesDir = getBuildClassesDir();
+  const instClassesDir  = path.join(inst.warDir, 'WEB-INF', 'classes');
   const buildTool  = detectBuildTool(ws);
   const allChanged = [];
 
-  log(t('logSyncStart'));
+  log(`[${inst.name}] ` + t('logSyncStart'));
 
-  // ── 의존성 classpath 미리 해석 (javac 폴백에서도 사용) ──
+  // ── 의존성 classpath 미리 해석 (공통) ──
   let depCp = '';
   if (buildTool === 'maven' || buildTool === 'gradle') {
     depCp = await resolveDependencyClasspath() || '';
   }
 
-  // ── 1) Java classes 동기화 ──
-  // javac 전체 컴파일 (Maven/Gradle도 동일 — HotSwap 일관성을 위해 javac 직접 사용)
-  const compileOk = await compileAllJava(ws, cfg, classesDir, depCp);
+  // ── 1) 공통 1회 컴파일 → .build/classes (mtime 스킵으로 2번째 인스턴스부터 거의 무비용) ──
+  const compileOk = await compileAllJava(ws, compileCfg, buildClassesDir, depCp);
 
-  // 익명/내부 클래스($포함) 제외, top-level class만 카운트
+  // ── 2) .build/classes → inst WEB-INF/classes 복사 + 고아 정리 ──
+  copyBuildToInstance(inst, common, allChanged);
+
+  // 익명/내부 클래스($포함) 제외, top-level class만 카운트 (.build 기준)
   const countTopLevelClasses = dir =>
     collectFiles(dir, ['.class']).filter(f => !path.basename(f, '.class').includes('$')).length;
   let javaCount = collectFiles(srcRoot, ['.java']).length;
@@ -2101,27 +2338,25 @@ async function syncAll() {
       javaCount += collectFiles(genBase, ['.java']).length;
     }
   }
-  const recount = countTopLevelClasses(classesDir);
+  const recount = countTopLevelClasses(buildClassesDir);
   if (javaCount !== recount) {
     log(t('warnCommentedJava', javaCount, recount), 'WARN');
     vscode.window.showWarningMessage(t('warnCommentedJava', javaCount, recount));
   }
 
-  // ── 2) 의존성 JAR → WEB-INF/lib 복사 및 정리 ──
+  // ── 3) 의존성 JAR → inst WEB-INF/lib 복사 및 정리 ──
   if (depCp) {
-    const libDir = path.join(cfg.warDir, 'WEB-INF', 'lib');
+    const libDir = path.join(inst.warDir, 'WEB-INF', 'lib');
     fs.mkdirSync(libDir, { recursive: true });
     const cpSep  = process.platform === 'win32' ? ';' : ':';
     const jars   = depCp.split(cpSep).filter(p => p.endsWith('.jar') && fs.existsSync(p));
     const jarNames = new Set(jars.map(p => path.basename(p)));
 
     // 고아 JAR 삭제
-    if (fs.existsSync(libDir)) {
-      for (const entry of fs.readdirSync(libDir)) {
-        if (entry.endsWith('.jar') && !jarNames.has(entry)) {
-          fs.rmSync(path.join(libDir, entry), { force: true });
-          log(t('logSyncOrphanDeleted', 'WEB-INF/lib/' + entry));
-        }
+    for (const entry of fs.readdirSync(libDir)) {
+      if (entry.endsWith('.jar') && !jarNames.has(entry)) {
+        fs.rmSync(path.join(libDir, entry), { force: true });
+        log(t('logSyncOrphanDeleted', 'WEB-INF/lib/' + entry));
       }
     }
 
@@ -2140,29 +2375,25 @@ async function syncAll() {
     log(t('logSyncJarDone', jarCount, jars.length));
   }
 
-  // ── 3) webContentRoot 전체 복사 및 정리 ──
+  // ── 4) webContentRoot 전체 복사 및 정리 → inst.warDir ──
   if (fs.existsSync(webSrcRoot)) {
-    // 고아 파일 삭제 (WEB-INF는 제외 - 수동/별도 관리됨)
-    purgeOrphanFiles(webSrcRoot, cfg.warDir, new Set(['WEB-INF']));
-
+    purgeOrphanFiles(webSrcRoot, inst.warDir, new Set(['WEB-INF']));
     const skipDirs = new Set(['classes', 'lib'].map(d =>
       path.join(webSrcRoot, 'WEB-INF', d)
     ));
-    const copied = copyDirSyncWithSkip(webSrcRoot, cfg.warDir, skipDirs, allChanged);
+    const copied = copyDirSyncWithSkip(webSrcRoot, inst.warDir, skipDirs, allChanged);
     if (copied > 0) log(t('logSyncWebContent', copied));
   }
 
-  // ── 4) resourceRoot → WEB-INF/classes 복사 및 정리 ──
+  // ── 5) resourceRoot → inst WEB-INF/classes ──
   if (fs.existsSync(resSrcRoot)) {
-    // resourceRoot에 대해서는 별도 purge를 하지 않음.
-    // (WEB-INF/classes는 이미 purgeOrphanClasses에서 통합 관리됨)
-    const copied = copyDirSync(resSrcRoot, classesDir, allChanged);
+    const copied = copyDirSync(resSrcRoot, instClassesDir, allChanged);
     if (copied > 0) log(t('logSyncResource', copied));
   }
 
   // ── 변경 파일 목록 출력 ──
   if (allChanged.length > 0) {
-    const baseDir = cfg.warDir + path.sep;
+    const baseDir = inst.warDir + path.sep;
     for (const f of allChanged) {
       const rel = f.startsWith(baseDir) ? f.slice(baseDir.length) : f;
       log(t('logSyncChanged', rel.replace(/\\/g, '/')));
@@ -2171,7 +2402,7 @@ async function syncAll() {
     log(t('logSyncNoChange'));
   }
 
-  log(t('logSyncDone', allChanged.length));
+  log(`[${inst.name}] ` + t('logSyncDone', allChanged.length));
   return compileOk;
 }
 
@@ -2185,8 +2416,8 @@ async function buildAndDeploy() {
 
   const buildTool = detectBuildTool(ws);
   if (buildTool) {
-    const cfg = getConfig();
-    const javaHome = cfg.javaHome || process.env.JAVA_HOME || '';
+    const common = getCommonConfig();
+    const javaHome = common.javaHome || process.env.JAVA_HOME || '';
     const env = { ...process.env };
     if (javaHome) env.JAVA_HOME = javaHome;
 
@@ -2211,15 +2442,19 @@ async function buildAndDeploy() {
     }
   }
 
-  initTomcatBase();
-  await syncAll();
+  // 실행 여부 무관 — 모든 인스턴스 전체 동기화
+  if (instances.size === 0) syncInstances();
+  for (const inst of instances.values()) {
+    initTomcatBase(inst);
+    await syncAll(inst);
+  }
 }
 
 // ══════════════════════════════════════════════════════════
 //  파일 저장 이벤트
 // ══════════════════════════════════════════════════════════
 async function onSaved(doc) {
-  if (!tomcatRunning) return;
+  if (runningInstances().length === 0) return;
 
   const fp  = doc.uri.fsPath;
   const ext = path.extname(fp).toLowerCase();
@@ -2231,12 +2466,12 @@ async function onSaved(doc) {
 
   const ws = getWorkspaceRoot();
   if (ws) {
-    const cfg = getConfig();
-    const webSrcRoot = path.join(ws, cfg.webContentRoot);
+    const common = getCommonConfig();
+    const webSrcRoot = path.join(ws, common.webContentRoot);
     const relWeb = path.relative(webSrcRoot, fp);
     if (!relWeb.startsWith('..')) { await deployStatic(fp); return; }
 
-    const resSrcRoot = path.join(ws, cfg.resourceRoot);
+    const resSrcRoot = path.join(ws, common.resourceRoot);
     const relRes = path.relative(resSrcRoot, fp);
     if (!relRes.startsWith('..')) await deployResource(fp);
   }
@@ -2267,9 +2502,6 @@ async function ensureWorkspaceSettings() {
   settings['tomcatAutoDeploy.catalinaHome'] = '';
   settings['tomcatAutoDeploy.javaHome'] = '';
   settings['tomcatAutoDeploy.port'] = 8080;
-  settings['tomcatAutoDeploy.debugPort'] = 5005;
-  settings['tomcatAutoDeploy.redirectPort'] = 8443;
-  settings['tomcatAutoDeploy.manualPortConfig'] = false;
   settings['tomcatAutoDeploy.contextPath'] = '/';
   settings['tomcatAutoDeploy.javaSourceRoot'] = 'src/main/java';
   settings['tomcatAutoDeploy.webContentRoot'] = 'src/main/webapp';
@@ -2287,11 +2519,282 @@ async function ensureWorkspaceSettings() {
 }
 
 // ══════════════════════════════════════════════════════════
+//  마이그레이션: 디렉토리 → default/
+// ══════════════════════════════════════════════════════════
+// .vscode/tomcat/{conf,apps,...}가 직하에 있으면(구버전) → .vscode/tomcat/default/로 1회 이동
+function migrateTomcatDirectory() {
+  const root = getTomcatRoot();
+  if (!root || !fs.existsSync(root)) return;
+  const hasConf = fs.existsSync(path.join(root, 'conf'));
+  const hasApps = fs.existsSync(path.join(root, 'apps'));
+  if (!hasConf && !hasApps) return;           // 구버전 베이스 아님
+  const defaultDir = path.join(root, 'default');
+  if (fs.existsSync(defaultDir)) return;       // 이미 인스턴스 하위폴더 존재
+
+  // 업그레이드 중 실행 중이던 구버전 Tomcat 감지 (신규 default는 catalinaBase가 달라 orphan 인식 불가)
+  let oldPid = null;
+  try { oldPid = parseInt(fs.readFileSync(path.join(root, 'tomcat.pid'), 'utf-8').trim(), 10) || null; } catch {}
+  if (oldPid && isProcessAlive(oldPid)) {
+    log(`[Migrate] 실행 중 업그레이드 감지 (PID=${oldPid}) — 기존 Tomcat을 수동 종료 후 재시작 권장`, 'WARN');
+    vscode.window.showWarningMessage('Tomcat: 실행 중 업그레이드가 감지되었습니다. 기존 Tomcat을 수동 종료 후 다시 시작하세요.');
+  }
+
+  fs.mkdirSync(defaultDir, { recursive: true });
+  // 화이트리스트만 이동 — dep-classpath.txt/.build/cp-init.gradle 등은 최상위 유지
+  for (const name of ['conf', 'apps', 'logs', 'work', 'temp', 'tomcat.pid']) {
+    const src = path.join(root, name);
+    if (!fs.existsSync(src)) continue;
+    const dest = path.join(defaultDir, name);
+    try {
+      fs.renameSync(src, dest);
+    } catch {
+      try { fs.cpSync(src, dest, { recursive: true }); fs.rmSync(src, { recursive: true, force: true }); } catch {}
+    }
+  }
+  log('[Migrate] .vscode/tomcat/{conf,apps,...} → .vscode/tomcat/default/ 이동 완료');
+}
+
+// instanceName 설정 변경 시 기존 catalinaBase 폴더를 새 이름으로 이전
+// syncInstances() 전에 호출해야 instances Map이 아직 이전 이름을 갖고 있음
+function migrateDefaultInstanceFolder() {
+  const newName = getDefaultInstanceName();
+  const root = getTomcatRoot();
+  if (!root) return;
+
+  // instances Map에서 extras(새 이름 기준)에 없는 항목 = 기존 기본 인스턴스
+  const extraNames = new Set(getExtraServers(newName).map(s => s.name));
+  let oldName = null;
+  for (const name of instances.keys()) {
+    if (!extraNames.has(name) && name !== newName) { oldName = name; break; }
+  }
+  if (!oldName) return;
+
+  const oldDir = path.join(root, oldName);
+  const newDir = path.join(root, newName);
+  if (!fs.existsSync(oldDir) || fs.existsSync(newDir)) return;
+
+  const inst = instances.get(oldName);
+  if (inst && (inst.running || inst.starting)) {
+    log(`[Migrate] "${oldName}" 실행 중 — 재시작 후 폴더를 "${newName}"으로 이전해 주세요.`, 'WARN');
+    vscode.window.showWarningMessage(
+      isKo ? `Tomcat: "${oldName}" 실행 중. 인스턴스를 재시작하면 폴더가 "${newName}"으로 이전됩니다.`
+           : `Tomcat: "${oldName}" is running. Restart the instance to rename its folder to "${newName}".`
+    );
+    return;
+  }
+
+  try {
+    fs.renameSync(oldDir, newDir);
+    log(`[Migrate] .vscode/tomcat/${oldName}/ → .vscode/tomcat/${newName}/ 이전 완료`);
+  } catch (err) {
+    log(`[Migrate] 폴더 이름 변경 실패 (${oldName} → ${newName}): ${err.message}`, 'WARN');
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  인스턴스 선택 (명령 인자 node 또는 QuickPick)
+// ══════════════════════════════════════════════════════════
+function instanceState(inst) {
+  return inst.orphanPid ? (isKo ? '외부 실행' : 'orphan')
+       : inst.starting  ? (isKo ? '기동중' : 'starting')
+       : inst.running   ? (isKo ? '실행중' : 'running')
+       :                  (isKo ? '정지' : 'stopped');
+}
+
+async function pickInstanceInteractive() {
+  const all = [...instances.values()];
+  if (all.length === 0) { vscode.window.showWarningMessage(isKo ? 'Tomcat: 설정된 서버가 없습니다.' : 'Tomcat: no servers configured.'); return null; }
+  if (all.length === 1) return all[0];
+  const pick = await vscode.window.showQuickPick(
+    all.map(i => ({ label: i.name, description: `:${i.port} ${instanceState(i)}`, inst: i })),
+    { placeHolder: isKo ? '인스턴스 선택' : 'Select instance' }
+  );
+  return pick ? pick.inst : null;
+}
+
+async function resolveInst(node) {
+  if (node && node.instanceName) return getInstance(node.instanceName);
+  return pickInstanceInteractive();
+}
+
+// ══════════════════════════════════════════════════════════
+//  인스턴스 추가/삭제 (UI → settings.json servers 배열 갱신)
+// ══════════════════════════════════════════════════════════
+
+// 과거 자동 마이그레이션이 남긴 servers:[{name:'default',...}] 정리 — 기본 인스턴스는 평면 설정이 소유
+async function cleanupLegacyDefaultServer() {
+  const cfg = vscode.workspace.getConfiguration('tomcatAutoDeploy');
+  const servers = cfg.get('servers', []);
+  const defaultName = getDefaultInstanceName();
+  if (!Array.isArray(servers) || !servers.some(s => s && s.name === defaultName)) return;
+  const extras = servers.filter(s => s && s.name !== defaultName);
+  await cfg.update('servers', extras.length ? extras : undefined, vscode.ConfigurationTarget.Workspace);
+  log(`[Config] 레거시 "${defaultName}" 서버 항목 제거 — 기본 인스턴스는 포트 설정으로 동작합니다.`);
+}
+
+// servers 배열 저장 → onDidChangeConfiguration 이 syncInstances/refresh 를 자동 반영
+function saveServers(servers) {
+  return vscode.workspace.getConfiguration('tomcatAutoDeploy')
+    .update('servers', servers, vscode.ConfigurationTarget.Workspace);
+}
+
+// 저장용 엔트리 — debug/redirect 포트와 java/catalina/opts 까지 전부 명시값으로 채운다.
+// (자동계산·공통 폴백에 의존하지 않고 settings.json 에 값이 다 박히도록)
+function explicitServerEntry(server, common, ws) {
+  const c = makeInstanceConfig(server, common, ws);
+  return {
+    name:         c.name,
+    port:         c.port,
+    debugPort:    c.debugPort,
+    redirectPort: c.redirectPort,
+    javaHome:     c.javaHome,
+    catalinaHome: c.catalinaHome,
+    javaOpts:     c.javaOpts,
+  };
+}
+
+// 후보 포트(http/debug/redirect)가 기존 인스턴스와 겹치면 소유자 이름 반환.
+function findPortOwner(port, servers, common, ws, excludeName) {
+  for (const s of servers) {
+    if (!s || s.name === excludeName || typeof s.port !== 'number') continue;
+    const c = makeInstanceConfig(s, common, ws);
+    if (port === c.port || port === c.debugPort || port === c.redirectPort) return s.name;
+  }
+  return null;
+}
+
+// 선택 입력 한 줄 (비우면 공통 설정 폴백). Escape → undefined 로 전체 취소 신호.
+function askOptional(step, label, placeHolder) {
+  return vscode.window.showInputBox({
+    title: isKo ? `인스턴스 추가 (${step}/5) — ${label} (선택)` : `Add instance (${step}/5) — ${label} (optional)`,
+    placeHolder,
+    ignoreFocusOut: true,
+  });
+}
+
+async function addInstanceCommand() {
+  const ws = getWorkspaceRoot();
+  if (!ws) {
+    vscode.window.showWarningMessage(isKo ? 'Tomcat: 워크스페이스를 먼저 여세요.' : 'Tomcat: open a workspace first.');
+    return;
+  }
+  const common    = getCommonConfig();
+  const effective = getServers();                  // 검증용 — 단일 모드의 평면 default 도 포함
+  const used      = new Set(effective.map(s => s.name));
+
+  const name = await vscode.window.showInputBox({
+    title: isKo ? '인스턴스 추가 (1/5) — 이름' : 'Add instance (1/5) — name',
+    placeHolder: isKo ? '예: staging' : 'e.g. staging',
+    ignoreFocusOut: true,
+    validateInput: (v) => {
+      const n = (v || '').trim();
+      if (!n) return isKo ? '이름을 입력하세요.' : 'Name is required.';
+      if (!/^[A-Za-z0-9._-]+$/.test(n)) return isKo ? '영문/숫자/. _ - 만 사용하세요.' : 'Use letters, digits, . _ - only.';
+      if (used.has(n)) return isKo ? `이미 존재하는 이름입니다: ${n}` : `Name already exists: ${n}`;
+      return null;
+    },
+  });
+  if (name === undefined) return;
+  const finalName = name.trim();
+
+  const portStr = await vscode.window.showInputBox({
+    title: isKo ? '인스턴스 추가 (2/5) — HTTP 포트' : 'Add instance (2/5) — HTTP port',
+    placeHolder: '8081',
+    ignoreFocusOut: true,
+    validateInput: (v) => {
+      const n = Number((v || '').trim());
+      if (!Number.isInteger(n) || n < 1 || n > 65535) return isKo ? '1~65535 사이 숫자를 입력하세요.' : 'Enter a number 1-65535.';
+      const owner = findPortOwner(n, effective, common, ws, null);
+      if (owner) return isKo ? `포트가 "${owner}"의 포트와 겹칩니다.` : `Port conflicts with "${owner}".`;
+      return null;
+    },
+  });
+  if (portStr === undefined) return;
+  const port = Number(portStr.trim());
+
+  // 선택 입력 — 비우면(또는 건너뛰면) 공통(javaHome/catalinaHome/javaOpts) 값을 명시적으로 채운다
+  const fallback     = isKo ? '비워두면 공통 설정값 사용 (Enter로 건너뜀)' : 'empty = use common setting (Enter to skip)';
+  const javaHome     = await askOptional(3, 'javaHome', fallback);
+  if (javaHome === undefined) return;
+  const catalinaHome = await askOptional(4, 'catalinaHome', fallback);
+  if (catalinaHome === undefined) return;
+  const javaOpts     = await askOptional(5, 'javaOpts', isKo ? '예: -Xmx1024m (비우면 공통)' : 'e.g. -Xmx1024m (empty = common)');
+  if (javaOpts === undefined) return;
+
+  // 사용자가 입력한 오버라이드만 반영 → explicitServerEntry 가 나머지를 공통값/자동계산으로 채워 모두 명시값으로 저장
+  const override = { name: finalName, port };
+  if (javaHome.trim())     override.javaHome     = javaHome.trim();
+  if (catalinaHome.trim()) override.catalinaHome = catalinaHome.trim();
+  if (javaOpts.trim())     override.javaOpts     = javaOpts.trim();
+
+  const entry = explicitServerEntry(override, common, ws);
+  // default 는 평면 설정이 소유 → servers 배열에는 "추가" 인스턴스만 저장 (leftover default 도 함께 정리됨)
+  await saveServers([...getExtraServers(), entry]);
+  log(`[Config] 인스턴스 추가: ${entry.name} (http:${entry.port} debug:${entry.debugPort} redirect:${entry.redirectPort})`);
+  vscode.window.showInformationMessage(
+    isKo ? `Tomcat 인스턴스 추가됨: ${entry.name} (:${entry.port})` : `Tomcat instance added: ${entry.name} (:${entry.port})`
+  );
+}
+
+async function removeInstanceCommand(node) {
+  const defaultName = getDefaultInstanceName();
+  const cannotRemoveDefault = () => vscode.window.showInformationMessage(isKo
+    ? `Tomcat: 기본 인스턴스(${defaultName})는 설정의 포트 값으로 동작합니다. 삭제 대신 설정에서 값을 변경하세요.`
+    : `Tomcat: the default instance (${defaultName}) is driven by the port setting. Change the setting instead of removing it.`);
+
+  const extras = getExtraServers(defaultName);      // 기본 인스턴스는 삭제 대상이 아님 (평면 설정 소유)
+
+  let name = node && node.instanceName;
+  if (name === defaultName) { cannotRemoveDefault(); return; }
+  if (!name) {
+    if (extras.length === 0) { cannotRemoveDefault(); return; }
+    const pick = await vscode.window.showQuickPick(
+      extras.map(s => ({ label: s.name, description: `:${s.port}` })),
+      { placeHolder: isKo ? '삭제할 인스턴스 선택' : 'Select instance to remove', ignoreFocusOut: true }
+    );
+    if (!pick) return;
+    name = pick.label;
+  }
+
+  const ok = await vscode.window.showWarningMessage(
+    isKo ? `인스턴스 "${name}" 설정을 삭제할까요? (.vscode/tomcat/${name}/ 폴더는 보존됩니다)`
+         : `Remove instance "${name}"? (the .vscode/tomcat/${name}/ folder is kept)`,
+    { modal: true },
+    isKo ? '삭제' : 'Remove'
+  );
+  if (!ok) return;
+
+  // 실행 중이면 먼저 정지 후 설정에서 제거
+  const inst = getInstance(name);
+  if (inst && (inst.running || inst.starting)) await stopTomcat(inst);
+
+  await saveServers(extras.filter(s => s.name !== name));
+  log(`[Config] 인스턴스 삭제: ${name}`);
+}
+
+// 상태바 클릭: 인스턴스 선택 → 상태에 따라 시작/정지
+async function pickInstanceCommand() {
+  const all = [...instances.values()];
+  if (all.length === 0) { vscode.window.showWarningMessage(isKo ? 'Tomcat: 설정된 서버가 없습니다.' : 'Tomcat: no servers configured.'); return; }
+  const pick = await vscode.window.showQuickPick(
+    all.map(i => ({
+      label: `${(i.running || i.orphanPid) ? '$(debug-stop)' : '$(play)'} ${i.name}`,
+      description: `:${i.port} ${instanceState(i)}`,
+      inst: i,
+    })),
+    { placeHolder: isKo ? '인스턴스 선택 → 시작/정지' : 'Select instance → start/stop' }
+  );
+  if (!pick) return;
+  const inst = pick.inst;
+  if (inst.running || inst.orphanPid) await stopTomcat(inst);
+  else if (!inst.starting) await startTomcat(inst);
+}
+
+// ══════════════════════════════════════════════════════════
 //  activate
 // ══════════════════════════════════════════════════════════
 function activate(context) {
   outputChannel = vscode.window.createOutputChannel('Tomcat Auto Deploy');
-  localhostLogChannel = vscode.window.createOutputChannel('Tomcat Localhost Log');
   outputChannel.show(true);
 
   let buildTime = t('devMode');
@@ -2301,16 +2804,10 @@ function activate(context) {
   } catch {}
   log(t('logActivated', buildTime));
 
-  ensureWorkspaceSettings();
-
   sbTomcat = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 102);
   sbDeploy = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 101);
   refreshDeployBar('idle');
   context.subscriptions.push(sbTomcat, sbDeploy);
-
-  if (!detectOrphanProcess()) {
-    refreshTomcatBar('stopped');
-  }
 
   tomcatTreeProvider = new TomcatTreeProvider();
   const treeView = vscode.window.createTreeView('tomcatServerView', {
@@ -2319,32 +2816,24 @@ function activate(context) {
   });
   context.subscriptions.push(treeView);
 
+  // 비동기 초기화: 설정 생성 → 마이그레이션 → 인스턴스 구성 → orphan 감지
+  (async () => {
+    await ensureWorkspaceSettings();
+    await cleanupLegacyDefaultServer();
+    migrateTomcatDirectory();
+    syncInstances();
+    for (const inst of instances.values()) detectOrphanProcess(inst);
+    refreshTomcatBar();
+  })();
+
   context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(onSaved));
 
-  let updatingPorts = false;
-  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(async (e) => {
-    if (updatingPorts) return;
+  // 설정(servers 등) 변경 → 인스턴스 Map 재조정
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((e) => {
     if (!e.affectsConfiguration('tomcatAutoDeploy')) return;
-    const cfg = vscode.workspace.getConfiguration('tomcatAutoDeploy');
-    if (cfg.get('manualPortConfig', false)) return;
-    const port = cfg.get('port', 8080);
-    const offset = port - 8080;
-    const expectedDebug = 5005 + offset;
-    const expectedRedirect = 8443 + offset;
-    const target = vscode.ConfigurationTarget.Workspace;
-    const curDebug = cfg.inspect('debugPort');
-    const curRedirect = cfg.inspect('redirectPort');
-    const needDebug = (curDebug.workspaceValue ?? curDebug.defaultValue) !== expectedDebug;
-    const needRedirect = (curRedirect.workspaceValue ?? curRedirect.defaultValue) !== expectedRedirect;
-    if (needDebug || needRedirect) {
-      updatingPorts = true;
-      try {
-        if (needDebug) await cfg.update('debugPort', expectedDebug, target);
-        if (needRedirect) await cfg.update('redirectPort', expectedRedirect, target);
-      } finally {
-        updatingPorts = false;
-      }
-    }
+    if (e.affectsConfiguration('tomcatAutoDeploy.instanceName')) migrateDefaultInstanceFolder();
+    syncInstances();
+    refreshTomcatBar();
   }));
 
   const depWatcher = vscode.workspace.createFileSystemWatcher('**/{pom.xml,build.gradle,build.gradle.kts}');
@@ -2354,30 +2843,42 @@ function activate(context) {
   context.subscriptions.push(depWatcher);
 
   const cmds = {
-    'tomcatAutoDeploy.start':       startTomcat,
-    'tomcatAutoDeploy.stop':        stopTomcat,
-    'tomcatAutoDeploy.forceStop':   forceStopTomcat,
-    'tomcatAutoDeploy.restart':     async () => { await stopTomcat(); await new Promise(r => setTimeout(r, 2000)); await startTomcat(); },
-    'tomcatAutoDeploy.deployAll':   async () => { initTomcatBase(); await syncAll(); },
-    'tomcatAutoDeploy.buildAndDeploy': buildAndDeploy,
-    'tomcatAutoDeploy.openBrowser': () => { const c = getConfig(); vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${c.port}${c.contextPath}`)); },
-    'tomcatAutoDeploy.showOutput':  () => outputChannel.show(),
-    'tomcatAutoDeploy.showLocalhostLog': () => localhostLogChannel.show(),
-    'tomcatAutoDeploy.configure':   () => vscode.commands.executeCommand('workbench.action.openWorkspaceSettings', { query: 'tomcatAutoDeploy' }),
-    'tomcatAutoDeploy.openServerXml': () => {
-      const cfg = getConfig();
-      const serverXml = path.join(cfg.confDir, 'server.xml');
-      if (!fs.existsSync(serverXml)) {
-        initTomcatBase();
+    'tomcatAutoDeploy.start':       async (node) => { const i = await resolveInst(node); if (i) await startTomcat(i); },
+    'tomcatAutoDeploy.stop':        async (node) => { const i = await resolveInst(node); if (i) await stopTomcat(i); },
+    'tomcatAutoDeploy.forceStop':   async (node) => { const i = await resolveInst(node); if (i) await forceStopTomcat(i); },
+    'tomcatAutoDeploy.restart':     async (node) => {
+      const i = await resolveInst(node); if (!i) return;
+      await stopTomcat(i); await new Promise(r => setTimeout(r, 2000)); await startTomcat(i);
+    },
+    'tomcatAutoDeploy.startAll':    async () => {
+      for (const i of instances.values()) {
+        if (i.running || i.orphanPid || i.starting) continue;  // 순차 — 포트충돌 다이얼로그 폭주 방지
+        await startTomcat(i);
       }
+    },
+    'tomcatAutoDeploy.stopAll':     async () => { for (const i of runningInstances()) await stopTomcat(i); },
+    'tomcatAutoDeploy.pickInstance': pickInstanceCommand,
+    'tomcatAutoDeploy.addInstance':    addInstanceCommand,
+    'tomcatAutoDeploy.removeInstance': removeInstanceCommand,
+    'tomcatAutoDeploy.deployAll':   async () => { for (const i of instances.values()) { initTomcatBase(i); await syncAll(i); } },
+    'tomcatAutoDeploy.buildAndDeploy': buildAndDeploy,
+    'tomcatAutoDeploy.openBrowser': async (node) => {
+      const i = await resolveInst(node);
+      if (i) vscode.env.openExternal(vscode.Uri.parse(`http://localhost:${i.port}${i.contextPath || '/'}`));
+    },
+    'tomcatAutoDeploy.showOutput':  async (node) => { const i = await resolveInst(node); if (i) getLogChannel(i).show(); else outputChannel.show(); },
+    'tomcatAutoDeploy.showLocalhostLog': async (node) => { const i = await resolveInst(node); if (i) getLocalhostChannel(i).show(); },
+    'tomcatAutoDeploy.configure':   () => vscode.commands.executeCommand('workbench.action.openWorkspaceSettings', { query: 'tomcatAutoDeploy' }),
+    'tomcatAutoDeploy.openServerXml': async (node) => {
+      const i = await resolveInst(node); if (!i) return;
+      const serverXml = path.join(i.confDir, 'server.xml');
+      if (!fs.existsSync(serverXml)) initTomcatBase(i);
       vscode.window.showTextDocument(vscode.Uri.file(serverXml));
     },
-    'tomcatAutoDeploy.openContextXml': () => {
-      const cfg = getConfig();
-      const contextXml = path.join(cfg.confDir, 'context.xml');
-      if (!fs.existsSync(contextXml)) {
-        initTomcatBase();
-      }
+    'tomcatAutoDeploy.openContextXml': async (node) => {
+      const i = await resolveInst(node); if (!i) return;
+      const contextXml = path.join(i.confDir, 'context.xml');
+      if (!fs.existsSync(contextXml)) initTomcatBase(i);
       vscode.window.showTextDocument(vscode.Uri.file(contextXml));
     },
   };
@@ -2386,37 +2887,37 @@ function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand(id, fn));
   }
 
-  context.subscriptions.push({ dispose: () => {
-    if (tomcatProcess && tomcatProcess.pid) {
-      if (process.platform === 'win32') {
-        try { require('child_process').execSync(`taskkill /F /T /PID ${tomcatProcess.pid}`, { stdio: 'ignore', shell: true }); } catch {}
-      } else {
-        tomcatProcess.kill('SIGTERM');
-      }
-    }
-  }});
+  context.subscriptions.push({ dispose: () => killAllInstances() });
 
   if (isJavaWebProject()) {
     vscode.window.showInformationMessage(
       t('ready'),
       t('btnStart'), t('btnSettings')
-    ).then(sel => {
-      if (sel === t('btnStart')) startTomcat();
+    ).then(async sel => {
+      if (sel === t('btnStart')) { const i = await pickInstanceInteractive(); if (i) startTomcat(i); }
       if (sel === t('btnSettings')) vscode.commands.executeCommand('tomcatAutoDeploy.configure');
     });
   }
 }
 
-function deactivate() {
-  stopLocalhostLogWatch();
-  if (tomcatProcess && tomcatProcess.pid) {
-    if (process.platform === 'win32') {
-      try { require('child_process').execSync(`taskkill /F /T /PID ${tomcatProcess.pid}`, { stdio: 'ignore', shell: true }); } catch {}
-    } else {
-      tomcatProcess.kill('SIGTERM');
+// 모든 인스턴스 프로세스/워처 종료 (deactivate/창 닫기 공통)
+function killAllInstances() {
+  const isWin = process.platform === 'win32';
+  for (const inst of instances.values()) {
+    try { inst.logWatcher && inst.logWatcher.close(); } catch {}
+    if (inst.proc && inst.proc.pid) {
+      if (isWin) {
+        try { require('child_process').execSync(`taskkill /F /T /PID ${inst.proc.pid}`, { stdio: 'ignore', shell: true }); } catch {}
+      } else {
+        try { inst.proc.kill('SIGTERM'); } catch {}
+      }
+      removePidFile(inst);
     }
-    removePidFile();
   }
+}
+
+function deactivate() {
+  killAllInstances();
 }
 
 module.exports = { activate, deactivate };
