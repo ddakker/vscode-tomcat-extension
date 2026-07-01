@@ -18,6 +18,7 @@
   "command.pickInstance": "Tomcat: Select Instance",
   "command.addInstance": "Tomcat: Add Instance",
   "command.removeInstance": "Tomcat: Remove Instance",
+  "command.deleteOrphanFolder": "Tomcat: Delete Orphan Folder",
   "view.server": "Server",
   "view.server.contextualTitle": "Tomcat Server",
   "config.instanceName.description": "Default instance name (used for .vscode/tomcat/<name>/ folder). Change to rename the primary server shown in the tree view.",

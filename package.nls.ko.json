@@ -18,6 +18,7 @@
   "command.pickInstance": "Tomcat: 인스턴스 선택",
   "command.addInstance": "Tomcat: 인스턴스 추가",
   "command.removeInstance": "Tomcat: 인스턴스 삭제",
+  "command.deleteOrphanFolder": "Tomcat: 고아 폴더 삭제",
   "view.server": "서버",
   "view.server.contextualTitle": "Tomcat 서버",
   "config.instanceName.description": "기본 인스턴스 이름 (.vscode/tomcat/<name>/ 폴더에 사용). 변경하면 트리뷰에 표시되는 기본 서버 이름이 바뀝니다.",

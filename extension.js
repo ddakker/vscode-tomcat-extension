@@ -225,6 +225,7 @@ function t(key, ...args) {
 //  전역 상태
 // ══════════════════════════════════════════════════════════
 const instances = new Map();   // name → InstanceState (동시 실행 지원)
+const warnedOrphanFolders = new Set(); // 이미 경고 로그를 남긴 고아 인스턴스 폴더 (세션당 1회)
 let outputChannel;             // 공통 [Deps]/[Sync]/[Build]/[Init]/[Java] 로그 (유지)
 let sbTomcat;                  // 요약 상태바
 let sbDeploy;                  // 공통 deploy 상태바
@@ -245,7 +246,7 @@ class TomcatTreeProvider {
 
   getChildren(element) {
     // 디렉토리 노드의 하위 항목
-    if (element && element.contextValue === 'tomcatDir') {
+    if (element && (element.contextValue === 'tomcatDir' || element.contextValue === 'orphanInstanceFolder')) {
       return this._getDirChildren(element.resourceUri.fsPath);
     }
     // 인스턴스 노드의 하위 항목
@@ -285,6 +286,21 @@ class TomcatTreeProvider {
     // ③ 인스턴스 노드
     for (const inst of all) {
       items.push(this._makeInstanceItem(inst));
+    }
+
+    // ③-1 설정에서 제거됐지만 디스크에 남은 고아 인스턴스 폴더 — 자동 삭제하지 않고 안내만
+    for (const dir of getOrphanInstanceFolders()) {
+      const name = path.basename(dir);
+      const orphan = this._makeDirItem(dir, name);
+      orphan.contextValue = 'orphanInstanceFolder';
+      orphan.description = isKo ? '설정에 없음 · 삭제 가능' : 'not in settings · deletable';
+      orphan.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('list.warningForeground'));
+      orphan.tooltip = isKo
+        ? `.vscode/tomcat/${name}/ — 인스턴스 설정에서 제거되어 더 이상 사용되지 않습니다.\n` +
+          `로그/컴파일 캐시가 남아있을 수 있으니 필요 없으면 우측 휴지통 버튼으로 삭제하세요.`
+        : `.vscode/tomcat/${name}/ — no longer used (removed from instance settings).\n` +
+          `May still contain logs/build cache — use the trash button to delete if not needed.`;
+      items.push(orphan);
     }
 
     // ④ 배포 파일 — 모든 인스턴스가 공유하는 docBase 디렉토리
@@ -626,6 +642,27 @@ function syncInstances() {
     disposeInstanceChannels(inst);
     instances.delete(name);
   }
+
+  // 설정에서 제거됐지만 디스크에 남은 인스턴스 폴더 — 자동 삭제하지 않고 안내만 (트리뷰 + 최초 1회 로그)
+  for (const dir of getOrphanInstanceFolders()) {
+    if (warnedOrphanFolders.has(dir)) continue;
+    warnedOrphanFolders.add(dir);
+    log(`[Config] 설정에 없는 인스턴스 폴더 발견: .vscode/tomcat/${path.basename(dir)}/ ` +
+        `(자동 삭제하지 않음 — 필요 없으면 수동으로 삭제하세요)`, 'WARN');
+  }
+}
+
+// 설정(instances Map)에 없는 .vscode/tomcat/<name> 폴더 목록.
+// webapp(공유 docBase)/.build(공유 빌드 캐시)는 인스턴스 폴더가 아니므로 제외.
+function getOrphanInstanceFolders() {
+  const root = getTomcatRoot();
+  if (!root || !fs.existsSync(root)) return [];
+  const reserved = new Set(['webapp', '.build']);
+  try {
+    return fs.readdirSync(root, { withFileTypes: true })
+      .filter(e => e.isDirectory() && !reserved.has(e.name) && !instances.has(e.name))
+      .map(e => path.join(root, e.name));
+  } catch { return []; }
 }
 
 function disposeInstanceChannels(inst) {
@@ -2930,6 +2967,31 @@ async function removeInstanceCommand(node) {
   log(`[Config] 인스턴스 삭제: ${name}`);
 }
 
+// 트리뷰의 고아 인스턴스 폴더(설정에 없는 .vscode/tomcat/<name>) 삭제 — 확인 후 실제 폴더까지 제거
+async function deleteOrphanFolderCommand(node) {
+  const dirPath = node && node.resourceUri && node.resourceUri.fsPath;
+  if (!dirPath || !fs.existsSync(dirPath)) return;
+  const name = path.basename(dirPath);
+
+  const ok = await vscode.window.showWarningMessage(
+    isKo ? `고아 인스턴스 폴더 "${name}"를 삭제할까요?\n.vscode/tomcat/${name}/ 전체가 영구 삭제되며 되돌릴 수 없습니다.`
+         : `Delete orphan instance folder "${name}"?\nThis permanently deletes .vscode/tomcat/${name}/ — this cannot be undone.`,
+    { modal: true },
+    isKo ? '삭제' : 'Delete'
+  );
+  if (!ok) return;
+
+  try {
+    fs.rmSync(dirPath, { recursive: true, force: true });
+    warnedOrphanFolders.delete(dirPath);
+    log(`[Config] 고아 인스턴스 폴더 삭제: .vscode/tomcat/${name}/`);
+  } catch (err) {
+    vscode.window.showErrorMessage(isKo ? `삭제 실패: ${err.message}` : `Delete failed: ${err.message}`);
+    return;
+  }
+  if (tomcatTreeProvider) tomcatTreeProvider.refresh();
+}
+
 // 상태바 클릭: 인스턴스 선택 → 상태에 따라 시작/정지
 async function pickInstanceCommand() {
   const all = [...instances.values()];
@@ -3018,6 +3080,7 @@ function activate(context) {
     'tomcatAutoDeploy.pickInstance': pickInstanceCommand,
     'tomcatAutoDeploy.addInstance':    addInstanceCommand,
     'tomcatAutoDeploy.removeInstance': removeInstanceCommand,
+    'tomcatAutoDeploy.deleteOrphanFolder': deleteOrphanFolderCommand,
     'tomcatAutoDeploy.deployAll':   async () => {
       try {
         for (const i of instances.values()) {
