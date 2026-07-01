@@ -33,6 +33,7 @@
       { "command": "tomcatAutoDeploy.configure",   "title": "%command.configure%",       "icon": "$(gear)"        },
       { "command": "tomcatAutoDeploy.deployAll",   "title": "%command.deployAll%",       "icon": "$(cloud-upload)" },
       { "command": "tomcatAutoDeploy.buildAndDeploy", "title": "%command.buildAndDeploy%", "icon": "$(tools)" },
+      { "command": "tomcatAutoDeploy.syncStaticOnly", "title": "%command.syncStaticOnly%", "icon": "$(file-media)" },
       { "command": "tomcatAutoDeploy.startAll",    "title": "%command.startAll%",        "icon": "$(run-all)"     },
       { "command": "tomcatAutoDeploy.stopAll",     "title": "%command.stopAll%",         "icon": "$(stop-circle)" },
       { "command": "tomcatAutoDeploy.pickInstance", "title": "%command.pickInstance%",   "icon": "$(server)"      },
@@ -78,6 +79,7 @@
         { "command": "tomcatAutoDeploy.stop",        "when": "view == tomcatServerView && viewItem == instanceStarting", "group": "inline@1" },
         { "command": "tomcatAutoDeploy.stop",        "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "inline@1" },
         { "command": "tomcatAutoDeploy.restart",     "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "inline@2" },
+        { "command": "tomcatAutoDeploy.forceStop",   "when": "view == tomcatServerView && viewItem == instanceStarting", "group": "inline@2" },
         { "command": "tomcatAutoDeploy.forceStop",   "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "inline@3" },
         { "command": "tomcatAutoDeploy.openBrowser", "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "inline@4" },
 
@@ -85,6 +87,7 @@
         { "command": "tomcatAutoDeploy.stop",        "when": "view == tomcatServerView && viewItem == instanceStarting", "group": "1_run@1" },
         { "command": "tomcatAutoDeploy.stop",        "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "1_run@1" },
         { "command": "tomcatAutoDeploy.restart",     "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "1_run@2" },
+        { "command": "tomcatAutoDeploy.forceStop",   "when": "view == tomcatServerView && viewItem == instanceStarting", "group": "1_run@2" },
         { "command": "tomcatAutoDeploy.forceStop",   "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "1_run@3" },
         { "command": "tomcatAutoDeploy.openBrowser", "when": "view == tomcatServerView && viewItem == instanceRunning",  "group": "2_view@1" },
         { "command": "tomcatAutoDeploy.showOutput",  "when": "view == tomcatServerView && viewItem =~ /^instance/",       "group": "2_view@2" },

@@ -12,6 +12,7 @@
   "command.configure": "Tomcat: 설정 열기",
   "command.deployAll": "Tomcat: 배포",
   "command.buildAndDeploy": "Tomcat: 빌드 후 배포",
+  "command.syncStaticOnly": "Tomcat: 웹/리소스 동기화",
   "command.startAll": "Tomcat: 모두 시작",
   "command.stopAll": "Tomcat: 모두 정지",
   "command.pickInstance": "Tomcat: 인스턴스 선택",

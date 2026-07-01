@@ -12,6 +12,7 @@
   "command.configure": "Tomcat: Open Settings",
   "command.deployAll": "Tomcat: Deploy All",
   "command.buildAndDeploy": "Tomcat: Build & Deploy",
+  "command.syncStaticOnly": "Tomcat: Sync Web/Resources",
   "command.startAll": "Tomcat: Start All",
   "command.stopAll": "Tomcat: Stop All",
   "command.pickInstance": "Tomcat: Select Instance",
