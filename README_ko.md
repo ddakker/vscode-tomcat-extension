@@ -39,8 +39,10 @@ VS Code에서도 클래스 핫디플로이를 통해서 Tomcat 재기동 없이 
 - **생성 소스 지원** — ANTLR, QueryDSL 등 빌드 도구가 생성한 `target/generated-sources` 하위 소스 자동 포함
 - **Maven & Gradle 지원** — 의존성 자동 해석 및 classpath 추가
 - **Java 버전 감지** — `pom.xml`이나 `build.gradle`에서 `source`/`target` 버전 자동 인식
+- **다중 인스턴스 실행** — 여러 Tomcat을 서로 다른 포트로 동시에 띄우고 사이드바에서 개별 제어. 같은 배포 대상은 파일 동기화 1회 후 인스턴스별 HotSwap만 적용하여 중복 작업 제거
+- **선택적 동기화** — 전체 배포, 빌드 후 배포, 웹/리소스만 동기화를 상황에 맞게 선택
 - **Tomcat 생명주기 관리** — 상태바 또는 사이드바에서 시작, 중지, 재시작, 강제 종료
-- **고아 프로세스 감지** — 이전 세션에서 남은 Tomcat 프로세스 자동 탐지
+- **고아 프로세스 · 폴더 감지** — 이전 세션에서 남은 Tomcat 프로세스, 설정에서 사라진 인스턴스 폴더 자동 탐지 및 정리
 - **실시간 로그 스트리밍** — Tomcat stdout 및 `localhost.log`를 전용 출력 패널에 표시
 - **크로스 플랫폼** — Windows, Linux, macOS 지원
 
@@ -75,7 +77,7 @@ package.bat
 **방법 B) 명령어로 설치:**
 
 ```bash
-code --install-extension tomcat-auto-deploy-0.10.0.vsix
+code --install-extension tomcat-auto-deploy-0.10.1.vsix
 ```
 
 ## 시작하기
@@ -119,6 +121,8 @@ code --install-extension tomcat-auto-deploy-0.10.0.vsix
 |------|------|--------|------|
 | `catalinaHome` | **필수** | — | Tomcat 설치 경로 (CATALINA_HOME) |
 | `javaHome` | 권장 | 환경변수 | JDK 경로 (미설정 시 `JAVA_HOME` 사용) |
+| `instanceName` | | `default` | 기본 인스턴스 이름 (`.vscode/tomcat/<name>/` 폴더에 사용) |
+| `servers` | | `[]` | 다중 인스턴스 목록 — 비워두면 단일 인스턴스로 동작 ([다중 인스턴스](#다중-인스턴스) 참고) |
 | `port` | | 8080 | HTTP 포트 — 디버그/리다이렉트 포트는 이 값 기준으로 자동 계산 |
 | `debugPort` | | 5005 | JPDA 디버그 포트 — 수동 설정 해제 시 HTTP 포트 기준 자동 계산 |
 | `redirectPort` | | 8443 | SSL 리다이렉트 포트 — 수동 설정 해제 시 HTTP 포트 기준 자동 계산 |
@@ -130,6 +134,26 @@ code --install-extension tomcat-auto-deploy-0.10.0.vsix
 | `classpath` | | `[]` | 컴파일에 포함할 추가 JAR 경로 목록 |
 | `javaOpts` | | `""` | Tomcat에 전달할 추가 JVM 옵션 (줄바꿈으로 구분) |
 
+## 다중 인스턴스
+
+여러 Tomcat을 서로 다른 포트로 동시에 띄울 수 있습니다. `servers`를 비워두면 위의 단일 설정(`port`/`debugPort`)으로 인스턴스 하나가 동작하고, 목록을 채우면 각 항목이 별도 인스턴스가 됩니다. 사이드바의 `+` 버튼(`인스턴스 추가`)으로도 추가할 수 있습니다.
+
+```json
+{
+  "tomcatAutoDeploy.servers": [
+    { "name": "default", "port": 8080 },
+    { "name": "staging", "port": 8081 }
+  ]
+}
+```
+
+인스턴스별 키: `name`, `port`(필수), `debugPort`, `redirectPort`, `javaHome`, `catalinaHome`, `javaOpts`.
+
+- 포트 생략 시 자동 계산 — 디버그 `5005 + (port - 8080)`, 리다이렉트 `8443 + (port - 8080)`
+- `javaHome` / `catalinaHome` / `javaOpts` 생략 시 공통 설정값으로 폴백
+- 각 인스턴스는 `.vscode/tomcat/<name>/` 베이스를 따로 가짐
+- 같은 배포 대상을 공유하면 파일 동기화는 1회만 수행하고, 인스턴스마다 HotSwap만 적용
+
 ## 명령어
 
 명령 팔레트(`Ctrl+Shift+P`) 및 사이드바에서 사용 가능:
@@ -140,12 +164,20 @@ code --install-extension tomcat-auto-deploy-0.10.0.vsix
 | Tomcat: 중지 | Tomcat 정상 종료 |
 | Tomcat: 강제 중지 | Tomcat 프로세스 즉시 종료 |
 | Tomcat: 재시작 | Tomcat 중지 후 시작 |
+| Tomcat: 모두 시작 | 모든 인스턴스 시작 |
+| Tomcat: 모두 정지 | 모든 인스턴스 정지 |
+| Tomcat: 인스턴스 선택 | 저장 시 배포/상태바 대상 인스턴스 선택 |
+| Tomcat: 인스턴스 추가 | 새 인스턴스를 `servers` 설정에 추가 |
+| Tomcat: 인스턴스 삭제 | 선택한 인스턴스를 `servers` 설정에서 삭제 |
+| Tomcat: 고아 폴더 삭제 | 설정에서 사라진 인스턴스의 `.vscode/tomcat/<name>/` 폴더 삭제 |
 | Tomcat: 브라우저 열기 | `http://localhost:{port}` 브라우저에서 열기 |
 | Tomcat: 출력 보기 | 메인 로그 패널 표시 |
 | Tomcat: Localhost 로그 | Tomcat의 `localhost.log` 전용 패널에 표시 |
 | Tomcat: server.xml 열기 | 생성된 `server.xml` 편집용으로 열기 |
+| Tomcat: context.xml 열기 | 생성된 `context.xml` 편집용으로 열기 |
 | Tomcat: 배포 | 전체 동기화 재실행 (`Ctrl+Alt+D`) |
 | Tomcat: 빌드 후 배포 | Maven/Gradle 컴파일 후 전체 동기화 (중지 상태에서만 표시, Maven/Gradle 프로젝트 전용) |
+| Tomcat: 웹/리소스 동기화 | Java 재컴파일 없이 정적 파일(JSP/HTML/CSS/JS/이미지)만 배포 |
 | Tomcat: 설정 열기 | 확장 프로그램 워크스페이스 설정 열기 |
 
 ## 상태바
@@ -159,7 +191,9 @@ code --install-extension tomcat-auto-deploy-0.10.0.vsix
 
 ## 사이드바
 
-액티비티 바의 Tomcat 패널에서 서버 제어, 로그 패널, 설정에 빠르게 접근할 수 있습니다.
+액티비티 바의 Tomcat 패널에서 서버 제어, 로그 패널, 설정에 빠르게 접근할 수 있습니다. 다중 인스턴스는 인스턴스별 트리 항목으로 표시되며 각 항목에서 시작/중지/재시작/강제 종료/브라우저 열기/설정 파일 열기를 개별 실행할 수 있습니다. HotSwap이 실패한 인스턴스에는 오류 아이콘과 "재기동 필요" 안내가 표시됩니다.
+
+![사이드바](sidebar.png)
 
 ## HotSwap 제한사항
 
@@ -176,7 +210,7 @@ JDWP HotSwap은 JVM의 기본 기능으로, 고유한 제한사항이 있습니�
 - 클래스 계층 변경 (extends/implements)
 - 람다 표현식 추가 또는 제거 (합성 메서드로 컴파일됨)
 
-HotSwap 실패 시 출력 패널에 경고가 표시됩니다. Tomcat을 재시작하면 변경사항이 반영됩니다.
+HotSwap 실패 시 출력 패널에 경고가 표시되고, 사이드바 트리의 해당 인스턴스에 오류 아이콘과 "재기동 필요" 안내가 나타납니다. Tomcat을 재시작하면 변경사항이 반영됩니다.
 
 ## 빌드 도구 연동
 

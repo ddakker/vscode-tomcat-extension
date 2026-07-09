@@ -39,8 +39,10 @@ For static files (JSP, HTML, CSS, JS, images, etc.), saving simply copies the fi
 - **Generated sources support** — ANTLR, QueryDSL, and other build-tool-generated sources under `target/generated-sources` are automatically included
 - **Maven & Gradle support** — Dependencies are automatically resolved and added to the classpath
 - **Java version detection** — Reads `source`/`target` from `pom.xml` or `build.gradle` to ensure bytecode compatibility
+- **Multi-instance support** — Run several Tomcat instances on different ports simultaneously, each controlled individually from the sidebar. When they share a deployment target, files are synced once and only HotSwap runs per instance — no duplicated work
+- **Selective sync** — Choose between full deploy, build & deploy, or web/resource-only sync as needed
 - **Tomcat lifecycle management** — Start, stop, restart, force kill from the status bar or sidebar
-- **Orphan process detection** — Finds Tomcat processes left running from a previous session
+- **Orphan process & folder detection** — Finds leftover Tomcat processes from a previous session and instance folders no longer in your settings
 - **Real-time log streaming** — Tomcat stdout and `localhost.log` displayed in dedicated output panels
 - **Cross-platform** — Windows, Linux, macOS
 
@@ -75,7 +77,7 @@ package.bat
 **Option B) Install from command line:**
 
 ```bash
-code --install-extension tomcat-auto-deploy-0.10.0.vsix
+code --install-extension tomcat-auto-deploy-0.10.1.vsix
 ```
 
 ## Getting Started
@@ -119,6 +121,8 @@ You can also open the settings GUI via Command Palette → `Tomcat: Open Setting
 |---------|----------|---------|-------------|
 | `catalinaHome` | **Yes** | — | Path to your Tomcat installation (CATALINA_HOME) |
 | `javaHome` | Recommended | env var | Path to JDK (uses `JAVA_HOME` if not set) |
+| `instanceName` | | `default` | Default instance name (used for the `.vscode/tomcat/<name>/` folder) |
+| `servers` | | `[]` | Multi-instance list — leave empty for a single instance (see [Multiple Instances](#multiple-instances)) |
 | `port` | | 8080 | HTTP port — debug/redirect ports are auto-calculated based on this value |
 | `debugPort` | | 5005 | JPDA debug port — auto-calculated from HTTP port when manual config is off |
 | `redirectPort` | | 8443 | SSL redirect port — auto-calculated from HTTP port when manual config is off |
@@ -130,6 +134,26 @@ You can also open the settings GUI via Command Palette → `Tomcat: Open Setting
 | `classpath` | | `[]` | Additional JAR paths to include in compilation |
 | `javaOpts` | | `""` | Extra JVM options passed to Tomcat (separated by newlines) |
 
+## Multiple Instances
+
+You can run several Tomcat instances on different ports at the same time. When `servers` is empty, a single instance runs from the flat settings (`port`/`debugPort`); fill in the list and each entry becomes its own instance. You can also add one via the `+` button (`Add Instance`) in the sidebar.
+
+```json
+{
+  "tomcatAutoDeploy.servers": [
+    { "name": "default", "port": 8080 },
+    { "name": "staging", "port": 8081 }
+  ]
+}
+```
+
+Per-instance keys: `name`, `port` (required), `debugPort`, `redirectPort`, `javaHome`, `catalinaHome`, `javaOpts`.
+
+- Omitted ports are auto-calculated — debug `5005 + (port - 8080)`, redirect `8443 + (port - 8080)`
+- Omitted `javaHome` / `catalinaHome` / `javaOpts` fall back to the shared settings
+- Each instance gets its own base under `.vscode/tomcat/<name>/`
+- When instances share a deployment target, files are synced once and only HotSwap runs per instance
+
 ## Commands
 
 Available from the Command Palette (`Ctrl+Shift+P`) and the sidebar:
@@ -140,12 +164,20 @@ Available from the Command Palette (`Ctrl+Shift+P`) and the sidebar:
 | Tomcat: Stop | Gracefully stop Tomcat |
 | Tomcat: Force Stop | Kill the Tomcat process immediately |
 | Tomcat: Restart | Stop and start Tomcat |
+| Tomcat: Start All | Start every instance |
+| Tomcat: Stop All | Stop every instance |
+| Tomcat: Pick Instance | Select the target instance for save-on-deploy and the status bar |
+| Tomcat: Add Instance | Add a new instance to the `servers` setting |
+| Tomcat: Remove Instance | Remove the selected instance from the `servers` setting |
+| Tomcat: Delete Orphan Folder | Delete a `.vscode/tomcat/<name>/` folder no longer in your settings |
 | Tomcat: Open Browser | Open `http://localhost:{port}` in your browser |
 | Tomcat: Show Output | Show the main log panel |
 | Tomcat: Localhost Log | Show Tomcat's `localhost.log` in a dedicated panel |
 | Tomcat: Open server.xml | Open the generated `server.xml` for editing |
+| Tomcat: Open context.xml | Open the generated `context.xml` for editing |
 | Tomcat: Deploy All | Re-run full sync (`Ctrl+Alt+D`) |
 | Tomcat: Build & Deploy | Run Maven/Gradle compile, then full sync (available when stopped, Maven/Gradle projects only) |
+| Tomcat: Sync Web/Resources | Deploy static files (JSP/HTML/CSS/JS/images) only, without recompiling Java |
 | Tomcat: Open Settings | Open workspace settings filtered to this extension |
 
 ## Status Bar
@@ -159,7 +191,9 @@ Available from the Command Palette (`Ctrl+Shift+P`) and the sidebar:
 
 ## Sidebar
 
-The Tomcat panel in the Activity Bar provides quick access to all server controls, log panels, and settings.
+The Tomcat panel in the Activity Bar provides quick access to all server controls, log panels, and settings. Multiple instances appear as individual tree items, each with its own start/stop/restart/force-stop/open-browser/open-config actions. An instance whose HotSwap failed is flagged with an error icon and a "restart required" hint.
+
+![Sidebar](sidebar.png)
 
 ## HotSwap Limitations
 
@@ -176,7 +210,7 @@ JDWP HotSwap is a JVM feature with inherent limitations. Understanding what it c
 - Changing class hierarchy (extends/implements)
 - Adding or removing lambda expressions (they compile to synthetic methods)
 
-When HotSwap fails, you'll see a warning in the Output panel. Just restart Tomcat to pick up the changes.
+When HotSwap fails, you'll see a warning in the Output panel, and the affected instance in the sidebar tree is flagged with an error icon and a "restart required" hint. Just restart Tomcat to pick up the changes.
 
 ## Build Tool Integration
 
@@ -206,7 +240,7 @@ If there's no `pom.xml` or `build.gradle`, the extension compiles all `.java` fi
 - Tomcat's `servlet-api` and other libraries are automatically included in the classpath
 - Compilation errors are shown in the Output panel (`Tomcat Auto Deploy`)
 - If VS Code crashes, the extension will detect the orphan Tomcat process on next startup and offer to kill it
-- `Java Opts` 설정에 `-Dfile.encoding=UTF-8` 등 인코딩 옵션이 기본 포함되어 있습니다 (필요 시 수정 가능)
+- The `javaOpts` setting includes encoding options such as `-Dfile.encoding=UTF-8` by default (editable as needed)
 
 ## License
 
