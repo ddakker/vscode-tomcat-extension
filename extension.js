@@ -195,6 +195,7 @@ const messages = {
                        '[Sync] javac compile failed → auto running full build/deploy'],
   progressBuilding:   ['{0} 빌드 중...',              'Building {0}...'],
   progressSyncing:    ['{0} 동기화 중...',             'Syncing {0}...'],
+  progressSyncingFiles: ['동기화 중...',               'Syncing...'],
   progressStaticSyncing: ['{0} 웹/리소스 동기화 중...', 'Syncing web/resources: {0}...'],
   logSettingsCreated: ['[Init] .vscode/settings.json에 기본 설정 생성',
                        '[Init] Default settings created in .vscode/settings.json'],
@@ -376,8 +377,16 @@ class TomcatTreeProvider {
       item.contextValue = 'instanceStarting';
     } else if (inst.running || inst.orphanPid) {
       const st = inst.orphanPid ? (isKo ? '외부 실행' : 'orphan') : (isKo ? '실행중' : 'running');
-      item.description  = `:${inst.port} ${st}`;
-      item.iconPath     = new vscode.ThemeIcon('vm-running', new vscode.ThemeColor('testing.iconPassed'));
+      if (inst.hotSwapFailed) {
+        item.description  = `:${inst.port} ${st} · ${isKo ? 'HotSwap 실패 — 재기동 필요' : 'HotSwap failed — restart needed'}`;
+        item.iconPath     = new vscode.ThemeIcon('error', new vscode.ThemeColor('list.errorForeground'));
+        item.tooltip      = isKo
+          ? '구조가 변경된 클래스가 있어 HotSwap이 실패했습니다. 최신 코드를 반영하려면 이 인스턴스를 재기동하세요.'
+          : 'HotSwap failed because a class structure changed. Restart this instance to apply the latest code.';
+      } else {
+        item.description  = `:${inst.port} ${st}`;
+        item.iconPath     = new vscode.ThemeIcon('vm-running', new vscode.ThemeColor('testing.iconPassed'));
+      }
       item.contextValue = 'instanceRunning';
     } else {
       item.description  = `:${inst.port} ${isKo ? '정지' : 'stopped'}`;
@@ -549,13 +558,14 @@ function getCompileConfig(common) {
 }
 
 // .build/classes → inst.warDir/WEB-INF/classes 복사 + inst classes 고아 정리
-function copyBuildToInstance(inst, common, allChanged) {
+// warDir는 모든 인스턴스가 공유하는 단일 배포 디렉토리 (lib/instances.js 참고)
+function copyBuildToWarDir(warDir, common, allChanged) {
   const ws = getWorkspaceRoot() || '';
   const buildClassesDir = getBuildClassesDir();
-  const instClassesDir  = path.join(inst.warDir, 'WEB-INF', 'classes');
-  fs.mkdirSync(instClassesDir, { recursive: true });
+  const classesDir = path.join(warDir, 'WEB-INF', 'classes');
+  fs.mkdirSync(classesDir, { recursive: true });
 
-  // 소스/리소스에 없는 .class·리소스 정리 (인스턴스 classes 기준)
+  // 소스/리소스에 없는 .class·리소스 정리
   const srcRoot    = path.join(ws, common.javaSourceRoot);
   const resSrcRoot = path.join(ws, common.resourceRoot);
   const genSourcesDirs = [];
@@ -570,10 +580,10 @@ function copyBuildToInstance(inst, common, allChanged) {
       }
     }
   }
-  purgeOrphanClasses(srcRoot, genSourcesDirs, resSrcRoot, instClassesDir);
+  purgeOrphanClasses(srcRoot, genSourcesDirs, resSrcRoot, classesDir);
 
   if (fs.existsSync(buildClassesDir)) {
-    return copyDirSync(buildClassesDir, instClassesDir, allChanged);
+    return copyDirSync(buildClassesDir, classesDir, allChanged);
   }
   return 0;
 }
@@ -1100,6 +1110,7 @@ async function startTomcat(inst) {
     return;
   }
   inst.starting = true;
+  inst.hotSwapFailed = false;
   refreshTomcatBar();
 
   // 시작 시 이 인스턴스 로그 패널만 비움 (공통 채널/다른 인스턴스 로그는 보존)
@@ -2088,14 +2099,16 @@ async function compileAndDeploy(savedFilePath) {
       if (inst.orphanPid || !inst.running) continue; // orphan은 디버그 연결 불명 → 디스크 반영만
       try {
         const result = await jdwpHotSwap(inst.debugPort, swapClasses);
-        if (result === 'ok') logTo(inst, t('logHotSwapOk', savedFilePath));
+        if (result === 'ok') { logTo(inst, t('logHotSwapOk', savedFilePath)); inst.hotSwapFailed = false; }
         else                 logTo(inst, t('logHotSwapSkip', className));
       } catch (err) {
         logTo(inst, t('logHotSwapFail', className, err.message), 'WARN');
         hotSwapFailed = true;
+        inst.hotSwapFailed = true;
       }
     }
     refreshDeployBar(hotSwapFailed ? 'warn' : 'ok', fname);
+    if (tomcatTreeProvider) tomcatTreeProvider.refresh();
   } catch (err) {
     log(t('logCompileFail', err.message), 'ERROR');
     refreshDeployBar('err', fname);
@@ -2426,18 +2439,24 @@ async function hotSwapChangedClasses(inst, changedFiles) {
   const label = t('logHotSwapBatch', swapClasses.length);
   try {
     const result = await jdwpHotSwap(inst.debugPort, swapClasses);
-    if (result === 'ok') logTo(inst, t('logHotSwapOk', label));
+    if (result === 'ok') { logTo(inst, t('logHotSwapOk', label)); inst.hotSwapFailed = false; }
     else                 logTo(inst, t('logHotSwapSkip', label));
     return true;
   } catch (err) {
     logTo(inst, t('logHotSwapFail', label, err.message), 'WARN');
+    inst.hotSwapFailed = true;
     return false;
   }
 }
 
-async function syncAll(inst) {
+/**
+ * 컴파일 + class/의존성 JAR/정적 파일을 공유 warDir(docBase)에 배포.
+ * 모든 인스턴스가 동일한 warDir를 쓰므로(lib/instances.js) 인스턴스 수와 무관하게 1회만 수행하면 된다.
+ * HotSwap은 포함하지 않음 — 실행 중인 인스턴스별로 호출측에서 hotSwapChangedClasses를 따로 호출해야 한다.
+ */
+async function syncFilesToWarDir(warDir) {
   const ws = getWorkspaceRoot();
-  if (!ws || !inst) return;
+  if (!ws) return { compileOk: false, classChanged: [] };
 
   const common     = getCommonConfig();
   const compileCfg = getCompileConfig(common);
@@ -2446,7 +2465,7 @@ async function syncAll(inst) {
   const buildTool  = detectBuildTool(ws);
   const allChanged = [];
 
-  log(`[${inst.name}] ` + t('logSyncStart'));
+  log(t('logSyncStart'));
 
   // ── 의존성 classpath 미리 해석 (공통) ──
   let depCp = '';
@@ -2454,17 +2473,13 @@ async function syncAll(inst) {
     depCp = await resolveDependencyClasspath() || '';
   }
 
-  // ── 1) 공통 1회 컴파일 → .build/classes (mtime 스킵으로 2번째 인스턴스부터 거의 무비용) ──
+  // ── 1) Java 컴파일 → .build/classes ──
   const compileOk = await compileAllJava(ws, compileCfg, buildClassesDir, depCp);
 
-  // ── 2) .build/classes → inst WEB-INF/classes 복사 + 고아 정리 ──
+  // ── 2) .build/classes → warDir/WEB-INF/classes 복사 + 고아 정리 ──
   const classChanged = [];
-  copyBuildToInstance(inst, common, classChanged);
+  copyBuildToWarDir(warDir, common, classChanged);
   allChanged.push(...classChanged);
-
-  // ── 2-1) 변경된 클래스 HotSwap (Tomcat 실행 중일 때만, 저장 시 compileAndDeploy와 동일한 방식) ──
-  const hotSwapOk = await hotSwapChangedClasses(inst, classChanged);
-  if (!hotSwapOk) refreshDeployBar('warn', inst.name);
 
   // 익명/내부 클래스($포함) 제외, top-level class만 카운트 (.build 기준)
   const countTopLevelClasses = dir =>
@@ -2484,9 +2499,9 @@ async function syncAll(inst) {
     vscode.window.showWarningMessage(t('warnCommentedJava', javaCount, recount));
   }
 
-  // ── 3) 의존성 JAR → inst WEB-INF/lib 복사 및 정리 ──
+  // ── 3) 의존성 JAR → warDir/WEB-INF/lib 복사 및 정리 ──
   if (depCp) {
-    const libDir = path.join(inst.warDir, 'WEB-INF', 'lib');
+    const libDir = path.join(warDir, 'WEB-INF', 'lib');
     fs.mkdirSync(libDir, { recursive: true });
     const cpSep  = process.platform === 'win32' ? ';' : ':';
     const jars   = depCp.split(cpSep).filter(p => p.endsWith('.jar') && fs.existsSync(p));
@@ -2516,11 +2531,11 @@ async function syncAll(inst) {
   }
 
   // ── 4,5) webContentRoot + resourceRoot 동기화 ──
-  syncStaticFiles(inst, common, allChanged);
+  syncStaticFiles(warDir, common, allChanged);
 
   // ── 변경 파일 목록 출력 ──
   if (allChanged.length > 0) {
-    const baseDir = inst.warDir + path.sep;
+    const baseDir = warDir + path.sep;
     for (const f of allChanged) {
       const rel = f.startsWith(baseDir) ? f.slice(baseDir.length) : f;
       log(t('logSyncChanged', rel.replace(/\\/g, '/')));
@@ -2529,54 +2544,70 @@ async function syncAll(inst) {
     log(t('logSyncNoChange'));
   }
 
-  log(`[${inst.name}] ` + t('logSyncDone', allChanged.length));
+  log(t('logSyncDone', allChanged.length));
+  return { compileOk, classChanged };
+}
+
+/**
+ * 인스턴스 1개 기동 시 전체 동기화: 공유 warDir 배포 + 이 인스턴스에 HotSwap 적용.
+ */
+async function syncAll(inst) {
+  if (!inst) return;
+
+  const { compileOk, classChanged } = await syncFilesToWarDir(inst.warDir);
+
+  const hotSwapOk = await hotSwapChangedClasses(inst, classChanged);
+  if (!hotSwapOk) refreshDeployBar('warn', inst.name);
+  if (tomcatTreeProvider) tomcatTreeProvider.refresh();
+
   return compileOk;
 }
 
 /**
- * webContentRoot + resourceRoot → inst.warDir 동기화 (java 컴파일/의존성 JAR 없이).
- * syncAll과 syncStaticOnly가 공유하는 정적 파일 복사 로직.
+ * webContentRoot + resourceRoot → warDir 동기화 (java 컴파일/의존성 JAR 없이).
+ * syncFilesToWarDir과 syncStaticOnly가 공유하는 정적 파일 복사 로직.
  */
-function syncStaticFiles(inst, common, allChanged) {
+function syncStaticFiles(warDir, common, allChanged) {
   const ws = getWorkspaceRoot();
-  if (!ws || !inst) return;
+  if (!ws) return;
 
-  const webSrcRoot     = path.join(ws, common.webContentRoot);
-  const resSrcRoot     = path.join(ws, common.resourceRoot);
-  const instClassesDir = path.join(inst.warDir, 'WEB-INF', 'classes');
+  const webSrcRoot  = path.join(ws, common.webContentRoot);
+  const resSrcRoot  = path.join(ws, common.resourceRoot);
+  const classesDir  = path.join(warDir, 'WEB-INF', 'classes');
 
-  // webContentRoot 전체 복사 및 정리 → inst.warDir
+  // webContentRoot 전체 복사 및 정리 → warDir
   if (fs.existsSync(webSrcRoot)) {
-    purgeOrphanFiles(webSrcRoot, inst.warDir, new Set(['WEB-INF']));
+    purgeOrphanFiles(webSrcRoot, warDir, new Set(['WEB-INF']));
     const skipDirs = new Set(['classes', 'lib'].map(d =>
       path.join(webSrcRoot, 'WEB-INF', d)
     ));
-    const copied = copyDirSyncWithSkip(webSrcRoot, inst.warDir, skipDirs, allChanged);
+    const copied = copyDirSyncWithSkip(webSrcRoot, warDir, skipDirs, allChanged);
     if (copied > 0) log(t('logSyncWebContent', copied));
   }
 
-  // resourceRoot → inst WEB-INF/classes
+  // resourceRoot → warDir/WEB-INF/classes
   if (fs.existsSync(resSrcRoot)) {
-    const copied = copyDirSync(resSrcRoot, instClassesDir, allChanged);
+    const copied = copyDirSync(resSrcRoot, classesDir, allChanged);
     if (copied > 0) log(t('logSyncResource', copied));
   }
 }
 
 /**
- * webContentRoot + resourceRoot(jsp/js/css/이미지/설정파일 등)만 재빌드/javac 없이 동기화. (전체 재빌드가 과도한 경우용)
+ * webContentRoot + resourceRoot(jsp/js/css/이미지/설정파일 등)만 재빌드/javac 없이 공유 warDir에 동기화.
+ * (전체 재빌드가 과도한 경우용. warDir는 모든 인스턴스가 공유하므로 1회만 수행하면 된다.)
  */
-async function syncStaticOnly(inst) {
+function syncStaticOnly(warDir) {
   const ws = getWorkspaceRoot();
-  if (!ws || !inst) return;
+  if (!ws) return;
 
   const common     = getCommonConfig();
   const allChanged = [];
 
-  log(`[${inst.name}] ` + t('logStaticSyncStart'));
-  syncStaticFiles(inst, common, allChanged);
+  log(t('logStaticSyncStart'));
+  syncStaticFiles(warDir, common, allChanged);
 
   if (allChanged.length > 0) {
-    const baseDir = inst.warDir + path.sep;
+    const baseDir = warDir + path.sep;
     for (const f of allChanged) {
       const rel = f.startsWith(baseDir) ? f.slice(baseDir.length) : f;
       log(t('logSyncChanged', rel.replace(/\\/g, '/')));
@@ -2585,7 +2616,7 @@ async function syncStaticOnly(inst) {
     log(t('logSyncNoChange'));
   }
 
-  log(`[${inst.name}] ` + t('logStaticSyncDone', allChanged.length));
+  log(t('logStaticSyncDone', allChanged.length));
 }
 
 /**
@@ -2627,17 +2658,28 @@ async function buildAndDeploy() {
       }
     }
 
-    // 실행 여부 무관 — 모든 인스턴스 전체 동기화
+    // 배포 파일(warDir)은 모든 인스턴스가 공유 → 파일 동기화는 1회만, HotSwap만 인스턴스별로 적용
     if (instances.size === 0) syncInstances();
-    for (const inst of instances.values()) {
+    const targets = [...instances.values()];
+    if (targets.length === 0) return;
+
+    for (const inst of targets) initTomcatBase(inst);
+
+    rebuildAllStatus = t('progressSyncingFiles');
+    if (tomcatTreeProvider) tomcatTreeProvider.refresh();
+    const { compileOk, classChanged } = await syncFilesToWarDir(targets[0].warDir);
+    if (compileOk === false) {
+      vscode.window.showErrorMessage(t('syncCompileFailMsg', targets[0].name));
+      outputChannel.show(true);
+    }
+
+    // HotSwap은 실행 중인(또는 외부 실행 중인) 인스턴스에만 적용
+    for (const inst of targets) {
+      if (!inst.running && !inst.orphanPid) continue;
       rebuildAllStatus = t('progressSyncing', inst.name);
       if (tomcatTreeProvider) tomcatTreeProvider.refresh();
-      initTomcatBase(inst);
-      const compileOk = await syncAll(inst);
-      if (compileOk === false) {
-        vscode.window.showErrorMessage(t('syncCompileFailMsg', inst.name));
-        outputChannel.show(true);
-      }
+      const hotSwapOk = await hotSwapChangedClasses(inst, classChanged);
+      if (!hotSwapOk) refreshDeployBar('warn', inst.name);
     }
   } finally {
     rebuildAllStatus = null;
@@ -3082,16 +3124,27 @@ function activate(context) {
     'tomcatAutoDeploy.removeInstance': removeInstanceCommand,
     'tomcatAutoDeploy.deleteOrphanFolder': deleteOrphanFolderCommand,
     'tomcatAutoDeploy.deployAll':   async () => {
+      const targets = [...instances.values()];
+      if (targets.length === 0) return;
       try {
-        for (const i of instances.values()) {
+        for (const i of targets) initTomcatBase(i);
+
+        // 배포 파일(warDir)은 모든 인스턴스가 공유 → 파일 동기화는 1회만 수행
+        syncAllStatus = t('progressSyncingFiles');
+        if (tomcatTreeProvider) tomcatTreeProvider.refresh();
+        const { compileOk, classChanged } = await syncFilesToWarDir(targets[0].warDir);
+        if (compileOk === false) {
+          vscode.window.showErrorMessage(t('syncCompileFailMsg', targets[0].name));
+          outputChannel.show(true);
+        }
+
+        // HotSwap은 실행 중인(또는 외부 실행 중인) 인스턴스에만 적용
+        for (const i of targets) {
+          if (!i.running && !i.orphanPid) continue;
           syncAllStatus = t('progressSyncing', i.name);
           if (tomcatTreeProvider) tomcatTreeProvider.refresh();
-          initTomcatBase(i);
-          const compileOk = await syncAll(i);
-          if (compileOk === false) {
-            vscode.window.showErrorMessage(t('syncCompileFailMsg', i.name));
-            outputChannel.show(true);
-          }
+          const hotSwapOk = await hotSwapChangedClasses(i, classChanged);
+          if (!hotSwapOk) refreshDeployBar('warn', i.name);
         }
       } finally {
         syncAllStatus = null;
@@ -3100,16 +3153,18 @@ function activate(context) {
     },
     'tomcatAutoDeploy.buildAndDeploy': buildAndDeploy,
     'tomcatAutoDeploy.syncStaticOnly': async () => {
+      const targets = [...instances.values()];
+      if (targets.length === 0) return;
       try {
-        for (const i of instances.values()) {
-          syncStaticStatus = t('progressStaticSyncing', i.name);
-          if (tomcatTreeProvider) tomcatTreeProvider.refresh();
-          // syncStaticOnly는 전부 동기 fs 호출이라 await 지점이 없음 — 트리뷰가
-          // "진행중" 상태를 실제로 렌더링할 틈을 주기 위해 한 틱 양보
-          await new Promise(r => setTimeout(r, 0));
-          initTomcatBase(i);
-          await syncStaticOnly(i);
-        }
+        for (const i of targets) initTomcatBase(i);
+
+        // 배포 파일(warDir)은 모든 인스턴스가 공유 → 정적 파일 동기화도 1회만 수행
+        syncStaticStatus = t('progressSyncingFiles');
+        if (tomcatTreeProvider) tomcatTreeProvider.refresh();
+        // syncStaticOnly는 전부 동기 fs 호출이라 await 지점이 없음 — 트리뷰가
+        // "진행중" 상태를 실제로 렌더링할 틈을 주기 위해 한 틱 양보
+        await new Promise(r => setTimeout(r, 0));
+        syncStaticOnly(targets[0].warDir);
       } finally {
         syncStaticStatus = null;
         if (tomcatTreeProvider) tomcatTreeProvider.refresh();
