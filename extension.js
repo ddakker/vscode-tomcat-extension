@@ -636,8 +636,8 @@ function syncInstances() {
       });
     } else {
       // 실행 중 → 변경 보류 (다음 재시작 때 반영)
-      if (cur.port !== fresh.port || cur.debugPort !== fresh.debugPort) {
-        log(`[Config] "${server.name}" 실행 중 — 포트 변경은 다음 재시작 때 반영됩니다.`, 'WARN');
+      if (cur.port !== fresh.port || cur.debugPort !== fresh.debugPort || cur.javaOpts !== fresh.javaOpts) {
+        log(`[Config] "${server.name}" 실행 중 — 설정 변경은 다음 재시작 때 반영됩니다.`, 'WARN');
       }
     }
   }
@@ -660,6 +660,15 @@ function syncInstances() {
     log(`[Config] 설정에 없는 인스턴스 폴더 발견: .vscode/tomcat/${path.basename(dir)}/ ` +
         `(자동 삭제하지 않음 — 필요 없으면 수동으로 삭제하세요)`, 'WARN');
   }
+}
+
+// 기동 직전 최신 설정을 다시 읽어 인스턴스에 반영한다.
+// syncInstances 는 실행 중인 인스턴스를 건너뛰므로, 실행 중에 바꾼 설정(javaOpts/포트 등)을
+// 여기서 반영하지 않으면 재시작해도 옛 값으로 뜬다.
+function reloadInstanceConfig(inst) {
+  const server = getServers().find(s => s && s.name === inst.name && typeof s.port === 'number');
+  if (!server) return;
+  Object.assign(inst, makeInstanceConfig(server, getCommonConfig(), getWorkspaceRoot() || ''));
 }
 
 // 설정(instances Map)에 없는 .vscode/tomcat/<name> 폴더 목록.
@@ -1109,6 +1118,7 @@ async function startTomcat(inst) {
     vscode.window.showWarningMessage(`${inst.name}: ${t('alreadyRunning')}`);
     return;
   }
+  reloadInstanceConfig(inst);   // 실행 중 변경된 설정을 기동 시점에 반영
   inst.starting = true;
   inst.hotSwapFailed = false;
   refreshTomcatBar();
