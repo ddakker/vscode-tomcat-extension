@@ -77,7 +77,7 @@ package.bat
 **방법 B) 명령어로 설치:**
 
 ```bash
-code --install-extension tomcat-auto-deploy-0.10.1.vsix
+code --install-extension tomcat-auto-deploy-0.10.2.vsix
 ```
 
 ## 시작하기
